@@ -115,6 +115,7 @@ function onEdit(e) {
       session_id: String(sessionId),
       decision: String(decision),
       notes: String(notes),
+      row_number: Number(row),
       row_data: fullRowData // Array of all columns A(0) to J(9)
     };
 

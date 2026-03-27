@@ -35,14 +35,12 @@ This PoC is designed so that **zero withdrawal requests are missed or skipped**,
 
 | Feature | File | Description |
 |---------|------|-------------|
-| **LLM Semaphore** | `agent.py` | `asyncio.Semaphore` throttles concurrent LLM calls (default: 50, configurable via `LLM_CONCURRENCY_LIMIT`). Excess requests queue instead of failing. |
-| **LLM Retry** | `agent.py` | Both `start_withdrawal` and `resume_withdrawal` auto-retry on 429/RESOURCE_EXHAUSTED errors with progressive delays (15s, 30s, 60s). |
-| **Sheets Lock** | `sheets_service.py` | `threading.Lock` serializes Google Sheets writes, preventing race conditions on row assignment. |
 | **Sheets Retry** | `sheets_service.py` | Exponential backoff (up to 5 retries) for Sheets API 429/5xx errors. |
-| **Gap-tolerant Row Finder** | `sheets_service.py` | Appends after the last filled row, not the first empty gap. |
+| **Gap-tolerant Row Finder** | `sheets_service.py` | Appends after the last filled row (scanning columns A-K), not the first empty gap. |
+| **Row-Drift Resilience** | `agent.py`, `main.py` | Distinguishes between multiple withdrawals for the same player using `row_number`. Survives if rows are shifted in the sheet. |
 | **Error Propagation** | `tools.py`, `main.py` | Sheet write failures and agent errors are returned to the caller (never silently swallowed). |
 | **Webhook Retry** | `apps_script.js` | Apps Script retries up to 3× with 2s/4s/8s backoff if the webhook fails, ensuring human decisions are never lost. |
-| **Correction Fallback** | `main.py` | If a webhook arrives for a session that was already finalized, the decision is applied directly via `player_id` from `row_data`. |
+| **Correction Fallback** | `main.py` | If a webhook arrives for a session that was already finalized, the decision is applied to the specific row via `row_number`. |
 
 ## Quick Start
 
@@ -159,8 +157,8 @@ When a player requests a withdrawal, ADA sends the details to the backend.
 ### 2. Poll for the Decision (GET)
 ADA should be set up to poll this endpoint automatically (e.g., every 10-15 seconds) to check if the human payment agent has finished reviewing the sheet.
 
-**Endpoint**: `GET http://<your-server-ip>:8000/ada/v1/status/{player_id}`
-*(Replace `{player_id}` dynamically with the player's ID, e.g., `/ada/v1/status/P100`)*
+**Endpoint**: `GET http://<your-server-ip>:8000/ada/v1/status/{player_id}/{row_number}`
+*(Replace `{player_id}` and `{row_number}` dynamically from Action 1's response)*
 
 #### How it works for stakeholders:
 1.  **Initial State**: Until a human reviews the sheet, this call returns `"decision": "pending"`.
@@ -206,7 +204,7 @@ Invoke-RestMethod -Uri "http://localhost:8000/ada/v1/request_review" `
 #   - Notes (Column J) = 'Verified manually'
 
 # 3. Poll status
-Invoke-RestMethod -Uri "http://localhost:8000/ada/v1/status/P100"
+Invoke-RestMethod -Uri "http://localhost:8000/ada/v1/status/P100/5"
 ```
 
 ### Concurrency Stress Test
@@ -239,8 +237,8 @@ The test script will:
 | -------- | ------------------------------ | ---------------------------------------------------------------------------------- |
 | `GET`  | `/health`                    | Health check + pending count                                                       |
 | `GET`  | `/sessions`                  | List pending session IDs                                                           |
-| `POST` | `/ada/v1/request_review`     | **ADA Integration**: Trigger a new withdrawal check (requires `player_id`) |
-| `GET`  | `/ada/v1/status/{player_id}` | **ADA Integration**: Poll the human decision for a player                    |
+| `POST` | `/ada/v1/request_review`     | **ADA Integration**: Trigger a new withdrawal check. Returns `row_number`. |
+| `GET`  | `/ada/v1/status/{player_id}/{row_number}` | **ADA Integration**: Poll the human decision for a specific row                    |
 | `POST` | `/test/withdrawal`           | Dev endpoint: Trigger with `session_id` and `player_id`                        |
 | `POST` | `/webhook`                   | Receive human decision (from Apps Script)                                          |
 

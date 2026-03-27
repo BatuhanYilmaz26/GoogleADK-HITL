@@ -87,8 +87,8 @@ runner = InMemoryRunner(
 # }
 pending_sessions: dict[str, dict[str, Any]] = {}
 
-# Maps player_id → dict with decision and notes. Helps ADA chatbot poll for results
-player_status: dict[str, dict[str, str]] = {}
+# Maps "player_id:row_number" → dict with decision and notes. Helps ADA chatbot poll for results
+player_status: dict[str, dict[str, Any]] = {}
 
 # ── Concurrency throttle ────────────────────────────────────────────
 # Limits simultaneous LLM calls to prevent API rate exhaustion.
@@ -147,24 +147,13 @@ async def start_withdrawal(
 ) -> dict[str, Any]:
     """
     Kick off a new withdrawal flow.
-
-    Creates an ADK session, sends the initial prompt to the agent,
-    and captures the pending FunctionResponse so the webhook can
-    resume the flow later after human review.
-
-    Every withdrawal is escalated — there is no auto-approve path.
-
-    Uses a semaphore to throttle concurrent LLM calls, and retries
-    on transient rate-limit errors.
-
+    ...
     Returns a summary dict.
     """
     logger.info(
         "➡️  Starting withdrawal: session=%s player=%s name=%s channel=%s",
         session_id, player_id, player_name, channel,
     )
-
-    player_status[player_id] = {"decision": "pending", "notes": "", "row_data": []}
 
     prompt = (
         f"Process withdrawal request:\n"
@@ -192,39 +181,58 @@ async def start_withdrawal(
 
     # Semaphore throttles how many LLM calls run simultaneously
     async with _llm_semaphore:
-        logger.debug(
-            "🔓 Semaphore acquired for session=%s",
-            session_id,
-        )
-        async for event in runner.run_async(
-            session_id=session.id,
-            user_id=config.USER_ID,
-            new_message=content,
-        ):
-            # Try to capture the long-running function call
-            if not long_running_fc:
-                long_running_fc = _extract_long_running_function_call(event)
-            elif long_running_fc:
-                potential = _extract_function_response(event, long_running_fc.id)
-                if potential:
-                    long_running_fr = potential
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async for event in runner.run_async(
+                    session_id=session.id,
+                    user_id=config.USER_ID,
+                    new_message=content,
+                ):
+                    # Try to capture the long-running function call
+                    if not long_running_fc:
+                        long_running_fc = _extract_long_running_function_call(event)
+                    elif long_running_fc:
+                        potential = _extract_function_response(event, long_running_fc.id)
+                        if potential:
+                            long_running_fr = potential
 
-            # Collect any text the agent emits
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if part.text:
-                        agent_texts.append(part.text)
+                    # Collect any text the agent emits
+                    if event.content and event.content.parts:
+                        for part in event.content.parts:
+                            if part.text:
+                                agent_texts.append(part.text)
+                # Success!
+                break
+            except Exception as exc:
+                if ("429" in str(exc) or "ResourceExhausted" in str(exc)) and attempt < max_attempts:
+                    wait_time = 15 * attempt
+                    logger.warning("⏳ Rate limit hit for %s (attempt %d/%d), retrying in %ds...", session_id, attempt, max_attempts, wait_time)
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
 
     # Store the pending response for resumption via webhook
     if long_running_fr:
+        # Extract row_number from the tool response if available
+        row_number = long_running_fr.response.get("row_number") if long_running_fr.response else None
+        
         pending_sessions[session_id] = {
             "function_response": long_running_fr,
             "player_id": player_id,
+            "row_number": row_number,
         }
-        logger.info("⏸️  Session %s paused — awaiting human decision", session_id)
+        
+        # Initialize the polling status with the row number
+        if row_number:
+            status_key = f"{player_id}:{row_number}"
+            player_status[status_key] = {"decision": "pending", "notes": "", "row_data": []}
+
+        logger.info("⏸️  Session %s paused — awaiting human decision (row %s)", session_id, row_number)
         return {
             "status": "pending_human_review",
             "session_id": session_id,
+            "row_number": row_number,
             "agent_message": " ".join(agent_texts) or "Submitted for human review.",
         }
 
@@ -242,6 +250,7 @@ async def resume_withdrawal(
     decision: str,
     notes: str,
     row_data: list[Any] | None = None,
+    current_row_number: int | None = None,
 ) -> dict[str, Any]:
     """
     Resume a paused withdrawal after the human provides a decision.
@@ -287,23 +296,50 @@ async def resume_withdrawal(
     agent_texts: list[str] = []
 
     async with _llm_semaphore:
-        async for event in runner.run_async(
-            session_id=session_id,
-            user_id=config.USER_ID,
-            new_message=resume_content,
-        ):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if part.text:
-                        agent_texts.append(part.text)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async for event in runner.run_async(
+                    session_id=session_id,
+                    user_id=config.USER_ID,
+                    new_message=resume_content,
+                ):
+                    if event.content and event.content.parts:
+                        for part in event.content.parts:
+                            if part.text:
+                                agent_texts.append(part.text)
+                break
+            except Exception as exc:
+                if ("429" in str(exc) or "ResourceExhausted" in str(exc)) and attempt < max_attempts:
+                    wait_time = 15 * attempt
+                    logger.warning("⏳ Rate limit hit for %s (resume attempt %d/%d), retrying in %ds...", session_id, attempt, max_attempts, wait_time)
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
 
     # Clean up
     del pending_sessions[session_id]
-    player_status[session_data["player_id"]] = {
+    
+    player_id = session_data["player_id"]
+    original_row = session_data.get("row_number")
+    
+    status_payload = {
         "decision": decision,
         "notes": notes,
         "row_data": row_data or [],
     }
+
+    # 1. Update the ORIGINAL status key (so ADA chatbot's initial poll succeeds)
+    if original_row:
+        player_status[f"{player_id}:{original_row}"] = status_payload
+    else:
+        player_status[player_id] = status_payload
+
+    # 2. Update the CURRENT status key (in case the row moved in the sheet)
+    if current_row_number and current_row_number != original_row:
+        player_status[f"{player_id}:{current_row_number}"] = status_payload
+        logger.info("📍 Updated status for shifted row %d (original was %s)", current_row_number, original_row)
+
     final_message = " ".join(agent_texts) or "Transaction finalized."
 
     logger.info("🏁 Session %s finalized: %s", session_id, final_message[:120])

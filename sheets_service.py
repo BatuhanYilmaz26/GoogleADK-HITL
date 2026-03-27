@@ -106,20 +106,21 @@ def append_review_row(
 
     with _append_lock:
         try:
-            col_c_data = _retry_api_call(
+            # Fetch entire range from A5:K to see if ANY column has data
+            all_cols_data = _retry_api_call(
                 lambda: service.spreadsheets().values().get(
                     spreadsheetId=config.SPREADSHEET_ID,
-                    range=f"{config.SHEET_NAME}!C5:C",
+                    range=f"{config.SHEET_NAME}!A5:K",
                 ).execute(),
-                description="Fetch Column C",
+                description="Fetch range A5:K",
             )
 
-            values = col_c_data.get("values", [])
+            values = all_cols_data.get("values", [])
 
-            # Find the first truly empty row after ALL filled rows.
+            # Find the absolute last row that has ANY data in columns A-K
             last_filled_index = -1
             for i, row in enumerate(values):
-                if row and row[0].strip():
+                if any(cell.strip() for cell in row if isinstance(cell, str)):
                     last_filled_index = i
 
             next_row = 5 + last_filled_index + 1
@@ -152,7 +153,7 @@ def append_review_row(
             )
 
             logger.info("✅ Sheet row updated at row %d (session=%s)", next_row, session_id)
-            return result
+            return {"result": result, "row_number": next_row}
         except Exception:
             logger.exception("❌ Failed to update row %d in Google Sheet", next_row)
             raise

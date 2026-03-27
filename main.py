@@ -35,6 +35,7 @@ class WebhookPayload(BaseModel):
     session_id: str = Field(..., description="ADK session ID from Column A")
     decision: str = Field(..., description="'Yes' or 'No' from Column I")
     notes: str = Field("", description="Context/notes from Column J")
+    row_number: int | None = Field(None, description="The specific row being edited")
     row_data: list[Any] = Field(default_factory=list, description="Array of columns A to J")
 
 
@@ -134,13 +135,15 @@ async def webhook(
         if len(payload.row_data) > 2:
             player_id = payload.row_data[2]
             if player_id:
-                agent_module.player_status[player_id] = {
+                # Use row_number in the key if available, else fallback to player_id
+                status_key = f"{player_id}:{payload.row_number}" if payload.row_number else player_id
+                agent_module.player_status[status_key] = {
                     "decision": payload.decision,
                     "notes": payload.notes,
                     "row_data": payload.row_data,
                 }
-                logger.info("📝 Applied human correction to already-finalized session %s (player=%s)", payload.session_id, player_id)
-                return {"status": "corrected", "message": f"Updated existing record for {player_id}"}
+                logger.info("📝 Applied human correction to finalized session %s (key=%s)", payload.session_id, status_key)
+                return {"status": "corrected", "message": f"Updated existing record for {status_key}"}
                 
         raise HTTPException(
             status_code=404,
@@ -153,6 +156,7 @@ async def webhook(
             decision=payload.decision,
             notes=payload.notes,
             row_data=payload.row_data,
+            current_row_number=payload.row_number,
         )
         return result
     except Exception as exc:
@@ -188,95 +192,55 @@ async def test_withdrawal(req: WithdrawalRequest):
 
 
 @app.post("/ada/v1/request_review")
-async def ada_request_review(req: AdaWithdrawalRequest, background_tasks: BackgroundTasks):
+async def ada_request_review(req: AdaWithdrawalRequest):
     """
     ADA Chatbot endpoint. ADA usually supplies only the player ID.
-    Using BackgroundTasks to ensure API responds < 15s to satisfy Ada webhook requirements.
+    Now including row_number in the response for multiple requests.
     """
     logger.info("🤖 ADA Request via Chatbot: player=%s", req.player_id)
-
-    # Note: We've relaxed the idempotency check to support the user's "Delete & Retry" testing flow.
-    # If a duplicate request for the same player arrived, we proceed with a new session ID
-    existing_status = agent_module.player_status.get(req.player_id)
-    if existing_status and existing_status.get("decision") == "pending":
-        logger.info("⏳ Withdrawal already pending for player=%s, but starting new session for tester retry", req.player_id)
 
     session_id = f"ada-{uuid.uuid4().hex}"
     logger.info("   ... Generated new session=%s", session_id)
     
-    # Initialize the status synchronously so that polling works immediately
-    agent_module.player_status[req.player_id] = {
-        "decision": "pending",
-        "notes": "",
-        "row_data": []
-    }
+    try:
+        # We wait for the first turn (tool call) to get the row number
+        result = await agent_module.start_withdrawal(
+            session_id=session_id,
+            player_id=req.player_id,
+            player_name=req.player_name,
+            channel=req.channel,
+        )
 
-    async def bg_task(pid: str = req.player_id, pname: str = req.player_name, pchannel: str = req.channel, base_sid: str = session_id):
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            # Append attempt number to avoid "session already exists" errors on retry
-            current_sid = f"{base_sid}-{attempt}" if attempt > 0 else base_sid
-            
-            try:
-                result = await agent_module.start_withdrawal(
-                    session_id=current_sid,
-                    player_id=pid,
-                    player_name=pname,
-                    channel=pchannel,
-                )
+        # Check if the agent actually succeeded in escalating
+        status = result.get("status", "")
+        if status == "pending_human_review":
+            row_number = result.get("row_number")
+            logger.info("✅ Agent waiting for human review at row %s", row_number)
+            return {
+                "status": "pending_human_review",
+                "session_id": session_id,
+                "row_number": row_number
+            }
+        else:
+            logger.error("❌ Agent did not escalate to HITL. Status: %s", status)
+            raise HTTPException(status_code=500, detail=f"Unexpected status: {status}")
 
-                # Check if the agent actually succeeded
-                status = result.get("status", "")
-                if status == "pending_human_review":
-                    logger.info("✅ Agent pending human review for player=%s (attempt %d)", pid, attempt + 1)
-                    return  # Success, exit the background task
-                elif status == "completed_unexpected":
-                    logger.error("❌ Agent did not escalate to HITL for player=%s", pid)
-                    agent_module.player_status[pid] = {
-                        "decision": "error",
-                        "notes": "Agent failed to escalate withdrawal to human review.",
-                        "row_data": []
-                    }
-                    return
-                else:
-                    logger.error("❌ Unexpected result status '%s' for player=%s", status, pid)
-                    agent_module.player_status[pid] = {
-                        "decision": "error",
-                        "notes": f"Unexpected status: {status}",
-                        "row_data": []
-                    }
-                    return
-
-            except Exception as exc:
-                if attempt < max_attempts - 1:
-                    logger.warning("⚠️ Transient error for ADA withdrawal %s (attempt %d). Retrying...: %s", current_sid, attempt + 1, str(exc))
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    logger.exception("🚨 Error starting ADA withdrawal %s after %d attempts", current_sid, max_attempts)
-                    agent_module.player_status[pid] = {
-                        "decision": "error",
-                        "notes": f"Internal server error: {exc}",
-                        "row_data": []
-                    }
-
-    # Offload the LLM call to async background task
-    background_tasks.add_task(bg_task)
-
-    return {
-        "status": "pending_human_review",
-        "session_id": session_id,
-    }
+    except Exception as exc:
+        logger.exception("🚨 Error starting ADA withdrawal session=%s", session_id)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/ada/v1/status/{player_id}")
-async def ada_check_status(player_id: str):
+@app.get("/ada/v1/status/{player_id}/{row_number}")
+async def ada_check_status(player_id: str, row_number: int):
     """
     ADA Chatbot endpoint to poll for the human decision.
     Returns: 'pending', 'Yes', 'No', or 'not_found' and any notes
     """
-    status_data = agent_module.player_status.get(player_id, {"decision": "not_found", "notes": ""})
+    status_key = f"{player_id}:{row_number}"
+    status_data = agent_module.player_status.get(status_key, {"decision": "not_found", "notes": ""})
     return {
         "player_id": player_id,
+        "row_number": row_number,
         "decision": status_data["decision"],
         "notes": status_data["notes"],
         "row_data": status_data.get("row_data", []),

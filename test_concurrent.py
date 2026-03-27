@@ -87,9 +87,10 @@ async def poll_status(
     session: aiohttp.ClientSession,
     base_url: str,
     player_id: str,
+    row_number: int,
 ) -> dict:
-    """Poll GET /ada/v1/status/{player_id}."""
-    url = f"{base_url}/ada/v1/status/{player_id}"
+    """Poll GET /ada/v1/status/{player_id}/{row_number}."""
+    url = f"{base_url}/ada/v1/status/{player_id}/{row_number}"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             return await resp.json()
@@ -140,10 +141,14 @@ async def run_test(
     mode: str,
     batch_size: int,
     batch_delay: float,
+    duplicate_player: str | None = None,
 ) -> None:
     """Main test runner."""
 
-    player_ids = [f"PTEST{i:03d}" for i in range(1, count + 1)]
+    if duplicate_player:
+        player_ids = [duplicate_player] * count
+    else:
+        player_ids = [f"PTEST{i:03d}" for i in range(1, count + 1)]
 
     print("=" * 70)
     print("  HITL Concurrency Stress Test")
@@ -218,9 +223,13 @@ async def run_test(
         print(f"🔍 Phase 2: Polling /ada/v1/status for each player ...")
         print()
 
-        statuses = await asyncio.gather(
-            *[poll_status(session, base_url, pid) for pid in player_ids]
-        )
+        poll_tasks = []
+        for r in all_results:
+            if r.ok:
+                row_num = r.body.get("row_number")
+                poll_tasks.append(poll_status(session, base_url, r.player_id, row_num))
+
+        statuses = await asyncio.gather(*poll_tasks)
 
         pending_count = 0
         for s in statuses:
@@ -268,9 +277,10 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Requests per batch (staggered mode)")
     parser.add_argument("--batch-delay", type=float, default=DEFAULT_BATCH_DELAY, help="Seconds between batches")
+    parser.add_argument("--duplicate", type=str, default=None, help="Test multiple requests for ONE player (e.g. --duplicate P100)")
     args = parser.parse_args()
 
-    asyncio.run(run_test(args.base_url, args.count, args.mode, args.batch_size, args.batch_delay))
+    asyncio.run(run_test(args.base_url, args.count, args.mode, args.batch_size, args.batch_delay, args.duplicate))
 
 
 if __name__ == "__main__":
