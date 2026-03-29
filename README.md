@@ -19,26 +19,6 @@ This system delivers **end-to-end withdrawal automation** — from the moment a 
 
 ![GoogleADK-HITL Infographics](GoogleADK-HITL%20Infographics.png)
 
-```
-┌──────────────┐     ┌──────────────────┐     ┌────────────────┐
-│ ADA Chatbot  │────▶│  FastAPI Server   │────▶│   ADK Agent    │
-│ (Automated)  │     │  POST /ada/...    │     │  (Gemini LLM)  │
-└──────────────┘     └──────────────────┘     └───────┬────────┘
-        ▲                     ▲                       │
-        │                     │             ┌─────────┘
-   GET /status                │             ▼ Requests Review
-   (Polling)                  │        ┌──────────────┐
-        │                POST /webhook │ Google Sheet  │◀──┐
-        │               (decision,     │ (HITL Dash)   │   │ onChange
-        │                notes,        └──────────────┘───┘ (Timestamp)
-        │                row_data)            │
-        │                     │               ▼
-        │               ┌────┴─────────────┐ Human reviews row,
-  (Returns full JSON    │   Apps Script     │ types Col I (Decision),
-   array of Col A-J)    │ (onEdit Trigger)  │ types Col J (Notes)
-        └──────────────│                   │
-                        └──────────────────┘
-```
 
 ### Sequence Flow
 
