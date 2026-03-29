@@ -44,10 +44,15 @@ def request_human_approval(
         session_id:  Unique session identifier for this withdrawal.
         player_id:   The player requesting the withdrawal.
         player_name: Optional name of the player.
-        channel:     The channel where the request originated (e.g., Chat, Email).
+        channel:     The channel where the request originated (``Chat`` or ``Email``).
 
     Returns:
-        A dict with status="pending" so ADK knows to pause.
+        A dict containing:
+        - ``status``:   ``"pending"`` on success, ``"error"`` on failure.
+        - ``message``:  Human-readable description of the outcome.
+        - ``session_id``: Echo of the input session ID.
+        - ``player_id``:  Echo of the input player ID.
+        - ``row_number``: The sheet row where the request was written (on success).
     """
     logger.info(
         "🔒 HITL escalation: session=%s player=%s name=%s channel=%s",

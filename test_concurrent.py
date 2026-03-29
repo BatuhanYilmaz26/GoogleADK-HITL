@@ -1,7 +1,7 @@
 """
 test_concurrent.py — Concurrency stress test for the HITL Payment Automation.
 
-Fires multiple POST requests to /ada/v1/request_review and verifies
+Fires multiple POST requests to /hitl/v1/request_review and verifies
 all sessions land correctly.
 
 Supports two modes:
@@ -57,8 +57,8 @@ async def fire_request(
     player_id: str,
     index: int = 0,
 ) -> TestResult:
-    """Send a single POST /ada/v1/request_review and return the result."""
-    url = f"{base_url}/ada/v1/request_review"
+    """Send a single POST /hitl/v1/request_review and return the result."""
+    url = f"{base_url}/hitl/v1/request_review"
     result = TestResult(player_id=player_id)
     t0 = time.perf_counter()
 
@@ -89,8 +89,8 @@ async def poll_status(
     player_id: str,
     row_number: int,
 ) -> dict:
-    """Poll GET /ada/v1/status/{player_id}/{row_number}."""
-    url = f"{base_url}/ada/v1/status/{player_id}/{row_number}"
+    """Poll GET /hitl/v1/status/{player_id}/{row_number}."""
+    url = f"{base_url}/hitl/v1/status/{player_id}/{row_number}"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             return await resp.json()
@@ -109,6 +109,31 @@ async def get_sessions(
             return await resp.json()
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ── Pre-flight check ────────────────────────────────────────────────
+
+
+async def preflight_check(base_url: str) -> bool:
+    """Verify the server is reachable before starting the test suite."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{base_url}/health",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    print(f"  ✅ Server reachable — status={data.get('status')}, "
+                          f"pending={data.get('pending_sessions')}, "
+                          f"model={data.get('model', '?')}")
+                    return True
+                else:
+                    print(f"  ❌ Server returned HTTP {resp.status}")
+                    return False
+    except Exception as exc:
+        print(f"  ❌ Cannot reach server at {base_url}: {exc}")
+        return False
 
 
 # ── Batch helpers ────────────────────────────────────────────────────
@@ -158,6 +183,13 @@ async def run_test(
     print("=" * 70)
     print()
 
+    # Pre-flight: ensure server is alive
+    print("🔍 Pre-flight check …")
+    if not await preflight_check(base_url):
+        print("\n❌ Aborting — server is not reachable. Start it with: python main.py")
+        sys.exit(1)
+    print()
+
     all_results: list[TestResult] = []
 
     async with aiohttp.ClientSession() as session:
@@ -187,7 +219,8 @@ async def run_test(
 
                 all_results.extend(batch_results)
 
-                if batch_num < total_batches:
+                # Only delay between batches, not after the last one
+                if batch_num < total_batches - 1:
                     print(f"  ⏳ Waiting {batch_delay}s before next batch (rate limit cooldown) ...")
                     await asyncio.sleep(batch_delay)
                 print()
@@ -220,7 +253,7 @@ async def run_test(
             print()
 
         # ── Phase 2: Poll status ─────────────────────────────────────
-        print(f"🔍 Phase 2: Polling /ada/v1/status for each player ...")
+        print(f"🔍 Phase 2: Polling /hitl/v1/status for each player ...")
         print()
 
         poll_tasks = []

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from google.adk.agents import LlmAgent
@@ -84,6 +85,8 @@ runner = InMemoryRunner(
 # Each entry: {
 #   "function_response": <types.FunctionResponse>,  # the pending tool response
 #   "player_id": str,
+#   "row_number": int | None,
+#   "created_at": float,  # monotonic timestamp for TTL expiry
 # }
 pending_sessions: dict[str, dict[str, Any]] = {}
 
@@ -95,6 +98,42 @@ player_status: dict[str, dict[str, Any]] = {}
 # Production (Vertex AI / Enterprise): 50 is safe for 1000+ RPM quota.
 # Free tier: lower to 2-3 via LLM_CONCURRENCY_LIMIT env var.
 _llm_semaphore = asyncio.Semaphore(config.LLM_CONCURRENCY_LIMIT)
+
+# ── TTL-based cleanup ───────────────────────────────────────────────
+# Stale sessions older than SESSION_TTL_HOURS are purged automatically
+# to prevent memory leaks in long-running deployments.
+SESSION_TTL_HOURS = 24
+_CLEANUP_INTERVAL = 3600  # run cleanup every hour
+_last_cleanup = 0.0
+
+
+def _cleanup_stale_entries() -> None:
+    """Remove pending sessions and player statuses older than TTL."""
+    global _last_cleanup
+    now = time.monotonic()
+    if now - _last_cleanup < _CLEANUP_INTERVAL:
+        return
+    _last_cleanup = now
+
+    ttl_seconds = SESSION_TTL_HOURS * 3600
+    stale_sessions = [
+        sid for sid, data in pending_sessions.items()
+        if now - data.get("created_at", now) > ttl_seconds
+    ]
+    for sid in stale_sessions:
+        entry = pending_sessions.pop(sid, {})
+        pid = entry.get("player_id", "?")
+        logger.warning("🧹 Evicted stale pending session %s (player=%s, age>%dh)", sid, pid, SESSION_TTL_HOURS)
+
+    # Clean up corresponding player_status entries that are still "pending"
+    stale_statuses = [
+        key for key, data in player_status.items()
+        if data.get("decision") == "pending"
+        and data.get("_created_at", now) < now - ttl_seconds
+    ]
+    for key in stale_statuses:
+        player_status.pop(key, None)
+        logger.warning("🧹 Evicted stale poll entry %s", key)
 
 
 # ── Helper: extract long-running call/response from events ──────────
@@ -147,9 +186,24 @@ async def start_withdrawal(
 ) -> dict[str, Any]:
     """
     Kick off a new withdrawal flow.
-    ...
-    Returns a summary dict.
+
+    Creates an ADK session, sends the request to the LLM, intercepts
+    the ``request_human_approval`` long-running tool call, and parks
+    the session until a human decision arrives via webhook.
+
+    Args:
+        session_id:  Unique session identifier for this withdrawal.
+        player_id:   The player requesting the withdrawal.
+        player_name: Optional display name for the player.
+        channel:     Origin channel (``Chat`` or ``Email``).
+
+    Returns:
+        A summary dict with keys ``status``, ``session_id``,
+        ``row_number``, and ``agent_message``.
     """
+    # Periodic housekeeping
+    _cleanup_stale_entries()
+
     logger.info(
         "➡️  Starting withdrawal: session=%s player=%s name=%s channel=%s",
         session_id, player_id, player_name, channel,
@@ -207,7 +261,10 @@ async def start_withdrawal(
             except Exception as exc:
                 if ("429" in str(exc) or "ResourceExhausted" in str(exc)) and attempt < max_attempts:
                     wait_time = 15 * attempt
-                    logger.warning("⏳ Rate limit hit for %s (attempt %d/%d), retrying in %ds...", session_id, attempt, max_attempts, wait_time)
+                    logger.warning(
+                        "⏳ Rate limit hit for session=%s (attempt %d/%d), retrying in %ds…",
+                        session_id, attempt, max_attempts, wait_time,
+                    )
                     await asyncio.sleep(wait_time)
                 else:
                     raise
@@ -216,17 +273,23 @@ async def start_withdrawal(
     if long_running_fr:
         # Extract row_number from the tool response if available
         row_number = long_running_fr.response.get("row_number") if long_running_fr.response else None
-        
+
         pending_sessions[session_id] = {
             "function_response": long_running_fr,
             "player_id": player_id,
             "row_number": row_number,
+            "created_at": time.monotonic(),
         }
-        
+
         # Initialize the polling status with the row number
         if row_number:
             status_key = f"{player_id}:{row_number}"
-            player_status[status_key] = {"decision": "pending", "notes": "", "row_data": []}
+            player_status[status_key] = {
+                "decision": "pending",
+                "notes": "",
+                "row_data": [],
+                "_created_at": time.monotonic(),
+            }
 
         logger.info("⏸️  Session %s paused — awaiting human decision (row %s)", session_id, row_number)
         return {
@@ -262,7 +325,17 @@ async def resume_withdrawal(
     Uses a semaphore to throttle concurrent LLM calls, and retries
     on transient rate-limit errors.
 
-    Returns a summary dict.
+    Args:
+        session_id:         The paused session to resume.
+        decision:           ``"Yes"`` or ``"No"`` from the human reviewer.
+        notes:              Free-text notes from the reviewer.
+        row_data:           Full row values (columns A-J) from the sheet.
+        current_row_number: The row number at the time of the edit
+                            (may differ from original if rows shifted).
+
+    Returns:
+        A summary dict with keys ``status``, ``session_id``,
+        ``decision``, and ``agent_message``.
     """
     logger.info(
         "▶️  Resuming session=%s decision=%s notes=%s",
@@ -312,17 +385,20 @@ async def resume_withdrawal(
             except Exception as exc:
                 if ("429" in str(exc) or "ResourceExhausted" in str(exc)) and attempt < max_attempts:
                     wait_time = 15 * attempt
-                    logger.warning("⏳ Rate limit hit for %s (resume attempt %d/%d), retrying in %ds...", session_id, attempt, max_attempts, wait_time)
+                    logger.warning(
+                        "⏳ Rate limit hit for session=%s (resume attempt %d/%d), retrying in %ds…",
+                        session_id, attempt, max_attempts, wait_time,
+                    )
                     await asyncio.sleep(wait_time)
                 else:
                     raise
 
-    # Clean up
-    del pending_sessions[session_id]
-    
+    # Clean up — guard against double-webhook race
+    pending_sessions.pop(session_id, None)
+
     player_id = session_data["player_id"]
     original_row = session_data.get("row_number")
-    
+
     status_payload = {
         "decision": decision,
         "notes": notes,

@@ -28,6 +28,57 @@ const COL_NOTES = 10;  // Column J
 const WEBHOOK_MAX_RETRIES = 3;
 const WEBHOOK_RETRY_DELAYS = [2000, 4000, 8000]; // milliseconds
 
+// Dead-letter sheet name for failed webhook deliveries
+const ERROR_LOG_SHEET = "ErrorLog";
+
+// ─── Configuration Validation ───────────────────────────────────────
+
+/**
+ * Checks that WEBHOOK_URL has been changed from the default placeholder.
+ * Returns true if configuration is valid.
+ */
+function _validateConfig() {
+  if (!WEBHOOK_URL || WEBHOOK_URL === "https://testurl.com/webhook") {
+    Logger.log(
+      "⛔ WEBHOOK_URL is still set to the default placeholder. " +
+      "Update it to your ngrok/Cloud Run URL before using triggers."
+    );
+    return false;
+  }
+  return true;
+}
+
+// ─── Dead-Letter Logging ────────────────────────────────────────────
+
+/**
+ * Logs a failed webhook delivery to a dedicated "ErrorLog" sheet tab.
+ * Creates the tab automatically if it does not exist.
+ *
+ * @param {number} row - The sheet row that triggered the webhook.
+ * @param {string} sessionId - The session ID from Column K.
+ * @param {string} errorMsg - Description of the failure.
+ */
+function _logDeadLetter(row, sessionId, errorMsg) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var errorSheet = ss.getSheetByName(ERROR_LOG_SHEET);
+
+    if (!errorSheet) {
+      errorSheet = ss.insertSheet(ERROR_LOG_SHEET);
+      errorSheet.appendRow(["Timestamp", "Row", "Session ID", "Error", "Webhook URL"]);
+      errorSheet.getRange(1, 1, 1, 5).setFontWeight("bold");
+    }
+
+    var timestamp = Utilities.formatDate(
+      new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd, HH:mm:ss"
+    );
+    errorSheet.appendRow([timestamp, row, sessionId, errorMsg, WEBHOOK_URL]);
+    Logger.log("📋 Dead-letter logged for row " + row + " (session=" + sessionId + ")");
+  } catch (logErr) {
+    Logger.log("⚠️ Failed to write dead-letter log: " + logErr.message);
+  }
+}
+
 // ─── Triggers ───────────────────────────────────────────────────────
 
 /**
@@ -38,6 +89,10 @@ const WEBHOOK_RETRY_DELAYS = [2000, 4000, 8000]; // milliseconds
 function onChange(e) {
   try {
     var sheet = e.source.getActiveSheet();
+
+    // Skip if the edit is on the ErrorLog sheet
+    if (sheet.getName() === ERROR_LOG_SHEET) return;
+
     var lastRow = sheet.getLastRow();
 
     if (lastRow <= 4) return;
@@ -81,10 +136,16 @@ function onChange(e) {
  */
 function onEdit(e) {
   try {
+    // Pre-flight: ensure WEBHOOK_URL is configured
+    if (!_validateConfig()) return;
+
     var range = e.range;
     var sheet = range.getSheet();
     var row = range.getRow();
     var col = range.getColumn();
+
+    // Skip edits on the ErrorLog sheet
+    if (sheet.getName() === ERROR_LOG_SHEET) return;
 
     // Trigger on Column I (Decision) or Column J (Notes) edits, skipping headers
     if ((col !== COL_DECISION && col !== COL_NOTES) || row <= 4) return;
@@ -133,6 +194,7 @@ function onEdit(e) {
 
     // Retry loop for webhook delivery — ensures human decisions are never lost
     var success = false;
+    var lastError = "";
     for (var attempt = 0; attempt < WEBHOOK_MAX_RETRIES; attempt++) {
       try {
         var response = UrlFetchApp.fetch(WEBHOOK_URL, options);
@@ -150,15 +212,17 @@ function onEdit(e) {
           success = true;
           break;
         } else {
+          lastError = "HTTP " + code + ": " + body;
           Logger.log(
             "⚠️ Webhook attempt " + (attempt + 1) + "/" + WEBHOOK_MAX_RETRIES +
-            " failed (HTTP " + code + "): " + body
+            " failed (" + lastError + ")"
           );
         }
       } catch (fetchErr) {
+        lastError = fetchErr.message;
         Logger.log(
           "⚠️ Webhook attempt " + (attempt + 1) + "/" + WEBHOOK_MAX_RETRIES +
-          " error: " + fetchErr.message
+          " error: " + lastError
         );
       }
 
@@ -169,10 +233,13 @@ function onEdit(e) {
     }
 
     if (!success) {
-      Logger.log(
-        "❌ CRITICAL: Webhook FAILED after " + WEBHOOK_MAX_RETRIES + " attempts for row " + row +
-        " (session=" + sessionId + "). Human decision may be LOST!"
-      );
+      var criticalMsg =
+        "Webhook FAILED after " + WEBHOOK_MAX_RETRIES + " attempts for row " + row +
+        " (session=" + sessionId + "). Last error: " + lastError;
+      Logger.log("❌ CRITICAL: " + criticalMsg);
+
+      // Write to dead-letter sheet so no human decision is ever silently lost
+      _logDeadLetter(row, sessionId, criticalMsg);
     }
 
   } catch (err) {

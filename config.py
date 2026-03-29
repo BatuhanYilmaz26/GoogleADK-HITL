@@ -1,8 +1,9 @@
 """
-config.py — Centralised configuration for the HITL Payment Automation PoC.
+config.py — Centralised configuration for the HITL Payment Automation.
 
 Loads environment variables via python-dotenv and exposes typed constants
-used across every other module.
+used across every other module.  All settings can be overridden by the
+corresponding environment variable in `.env`.
 """
 
 from __future__ import annotations
@@ -20,12 +21,15 @@ load_dotenv(_env_path)
 
 # ── Google Gemini ────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
-MODEL_ID: str = "gemini-3-flash-preview"  # fast + cost-effective for a PoC
+MODEL_ID: str = os.getenv("MODEL_ID", "gemini-3-flash-preview")
 
 # ── Google Sheets ────────────────────────────────────────────────────
 SPREADSHEET_ID: str = os.getenv("SPREADSHEET_ID", "")
 SHEET_NAME: str = os.getenv("SHEET_NAME", "Sheet1")
 SHEETS_API_KEY: str = os.getenv("SHEETS_API_KEY", "")
+
+# ── Service Account ─────────────────────────────────────────────────
+SERVICE_ACCOUNT_PATH: str = os.getenv("SERVICE_ACCOUNT_PATH", "service_account.json")
 
 # ── Webhook ──────────────────────────────────────────────────────────
 WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
@@ -57,7 +61,12 @@ def setup_logging() -> None:
         force=True,
     )
     # Silence noisy third-party loggers
-    for noisy in ("httpcore", "httpx", "urllib3", "googleapiclient.discovery_cache"):
+    for noisy in (
+        "httpcore", "httpx", "urllib3",
+        "googleapiclient.discovery_cache",
+        "googleapiclient.discovery",
+        "google.auth.transport.requests",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -73,4 +82,15 @@ def validate() -> None:
         sys.exit(
             f"❌  Missing required environment variables: {', '.join(missing)}\n"
             f"   Copy .env.example → .env and fill in the values."
+        )
+
+    # Warn (don't crash) if the service account file is missing — API-key
+    # fallback still works for read-only access.
+    sa_path = Path(SERVICE_ACCOUNT_PATH)
+    if not sa_path.exists():
+        logging.getLogger(__name__).warning(
+            "⚠️  Service account file '%s' not found. "
+            "Sheets API will use API-key auth (read-only). "
+            "Set SERVICE_ACCOUNT_PATH in .env to fix.",
+            SERVICE_ACCOUNT_PATH,
         )

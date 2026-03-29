@@ -12,18 +12,31 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import config
 import agent as agent_module
 
 logger = logging.getLogger(__name__)
+
+# ── Runtime metrics ──────────────────────────────────────────────────
+_startup_time: float = 0.0
+_metrics = {
+    "requests_total": 0,
+    "requests_succeeded": 0,
+    "requests_failed": 0,
+    "webhooks_received": 0,
+    "webhooks_corrections": 0,
+}
 
 
 # ── Pydantic models ──────────────────────────────────────────────────
@@ -32,7 +45,7 @@ logger = logging.getLogger(__name__)
 class WebhookPayload(BaseModel):
     """Payload sent by Google Apps Script when a human edits the Sheet."""
 
-    session_id: str = Field(..., description="ADK session ID from Column A")
+    session_id: str = Field(..., description="ADK session ID from Column K")
     decision: str = Field(..., description="'Yes' or 'No' from Column I")
     notes: str = Field("", description="Context/notes from Column J")
     row_number: int | None = Field(None, description="The specific row being edited")
@@ -60,6 +73,9 @@ class AdaWithdrawalRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown hooks."""
+    global _startup_time
+    _startup_time = time.monotonic()
+
     config.setup_logging()
     config.validate()
 
@@ -69,6 +85,8 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 HITL Payment Automation server starting …")
     logger.info("   Model   : %s", config.MODEL_ID)
     logger.info("   Sheet   : %s", config.SPREADSHEET_ID[:12] + "…")
+    logger.info("   SA Path : %s", config.SERVICE_ACCOUNT_PATH)
+    logger.info("   LLM Pool: %d concurrent", config.LLM_CONCURRENCY_LIMIT)
     logger.info("   Mode    : ALL withdrawals require human approval")
     yield
     logger.info("👋 Server shutting down")
@@ -78,8 +96,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="HITL Payment Automation",
-    version="1.0.0",
+    description=(
+        "Human-in-the-Loop payment automation for regulated iGaming platforms. "
+        "Uses Google ADK agents with mandatory human review via Google Sheets."
+    ),
+    version="2.0.0",
     lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# ── CORS Middleware ──────────────────────────────────────────────────
+# Allows cross-origin requests from ADA chatbot embeds and admin dashboards.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict in production to specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -88,10 +122,26 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    """Health-check endpoint."""
+    """Health-check endpoint with uptime and pending session count."""
+    uptime_seconds = time.monotonic() - _startup_time if _startup_time else 0
     return {
         "status": "ok",
+        "uptime_seconds": round(uptime_seconds, 1),
         "pending_sessions": len(agent_module.pending_sessions),
+        "model": config.MODEL_ID,
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Operational metrics for monitoring and observability."""
+    uptime_seconds = time.monotonic() - _startup_time if _startup_time else 0
+    return {
+        "uptime_seconds": round(uptime_seconds, 1),
+        "pending_sessions": len(agent_module.pending_sessions),
+        "tracked_statuses": len(agent_module.player_status),
+        "llm_concurrency_limit": config.LLM_CONCURRENCY_LIMIT,
+        **_metrics,
     }
 
 
@@ -117,6 +167,8 @@ async def webhook(
 
     This endpoint resumes the paused ADK agent with that decision.
     """
+    _metrics["webhooks_received"] += 1
+
     # Optional shared-secret validation
     if config.WEBHOOK_SECRET and x_webhook_secret != config.WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
@@ -142,9 +194,10 @@ async def webhook(
                     "notes": payload.notes,
                     "row_data": payload.row_data,
                 }
+                _metrics["webhooks_corrections"] += 1
                 logger.info("📝 Applied human correction to finalized session %s (key=%s)", payload.session_id, status_key)
                 return {"status": "corrected", "message": f"Updated existing record for {status_key}"}
-                
+
         raise HTTPException(
             status_code=404,
             detail=f"No pending session found for session_id={payload.session_id}",
@@ -158,8 +211,10 @@ async def webhook(
             row_data=payload.row_data,
             current_row_number=payload.row_number,
         )
+        _metrics["requests_succeeded"] += 1
         return result
     except Exception as exc:
+        _metrics["requests_failed"] += 1
         logger.exception("Error resuming session %s", payload.session_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -171,6 +226,8 @@ async def test_withdrawal(req: WithdrawalRequest):
 
     Useful for testing without an external caller.
     """
+    _metrics["requests_total"] += 1
+
     logger.info(
         "🧪 Test withdrawal: session=%s player=%s",
         req.session_id,
@@ -187,21 +244,24 @@ async def test_withdrawal(req: WithdrawalRequest):
         )
         return result
     except Exception as exc:
+        _metrics["requests_failed"] += 1
         logger.exception("Error starting withdrawal %s", req.session_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/ada/v1/request_review")
+@app.post("/hitl/v1/request_review")
 async def ada_request_review(req: AdaWithdrawalRequest):
     """
     ADA Chatbot endpoint. ADA usually supplies only the player ID.
     Now including row_number in the response for multiple requests.
     """
+    _metrics["requests_total"] += 1
+
     logger.info("🤖 ADA Request via Chatbot: player=%s", req.player_id)
 
     session_id = f"ada-{uuid.uuid4().hex}"
-    logger.info("   ... Generated new session=%s", session_id)
-    
+    logger.info("   … Generated new session=%s", session_id)
+
     try:
         # We wait for the first turn (tool call) to get the row number
         result = await agent_module.start_withdrawal(
@@ -222,15 +282,19 @@ async def ada_request_review(req: AdaWithdrawalRequest):
                 "row_number": row_number
             }
         else:
+            _metrics["requests_failed"] += 1
             logger.error("❌ Agent did not escalate to HITL. Status: %s", status)
             raise HTTPException(status_code=500, detail=f"Unexpected status: {status}")
 
+    except HTTPException:
+        raise  # re-raise FastAPI HTTPException as-is
     except Exception as exc:
+        _metrics["requests_failed"] += 1
         logger.exception("🚨 Error starting ADA withdrawal session=%s", session_id)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/ada/v1/status/{player_id}/{row_number}")
+@app.get("/hitl/v1/status/{player_id}/{row_number}")
 async def ada_check_status(player_id: str, row_number: int):
     """
     ADA Chatbot endpoint to poll for the human decision.
