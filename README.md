@@ -4,6 +4,8 @@
 
 ## Overview
 
+![HITL Automation](hitl_automation.png)
+
 This system delivers **end-to-end withdrawal automation** — from the moment a player requests a withdrawal in the chatbot, to the final decision being relayed back, with zero manual data entry in between.
 
 - **Fast & Asynchronous**: Built with FastAPI Background Tasks to ensure sub-10ms response times for the chatbot, eliminating webhook timeouts.
