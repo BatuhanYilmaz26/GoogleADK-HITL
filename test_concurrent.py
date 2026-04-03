@@ -1,5 +1,5 @@
 """
-test_concurrent.py — Concurrency stress test for the HITL Payment Automation.
+test_concurrent.py - Concurrency stress test for the HITL Payment Automation.
 
 Fires multiple POST requests to /hitl/v1/request_review and verifies
 all sessions land correctly.
@@ -123,14 +123,14 @@ async def preflight_check(base_url: str) -> bool:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    print(f"  ✅ Server reachable — status={data.get('status')}, "
+                    print(f"  Server reachable - status={data.get('status')}, "
                           f"tracked={data.get('tracked_sessions')}")
                     return True
                 else:
-                    print(f"  ❌ Server returned HTTP {resp.status}")
+                    print(f"  Server returned HTTP {resp.status}")
                     return False
     except Exception as exc:
-        print(f"  ❌ Cannot reach server at {base_url}: {exc}")
+        print(f"  Cannot reach server at {base_url}: {exc}")
         return False
 
 
@@ -176,15 +176,15 @@ async def run_test(
     print("=" * 70)
     print("  HITL Concurrency Stress Test")
     print(f"  Target : {base_url}")
-    print(f"  Players: {count} requests ({player_ids[0]} – {player_ids[-1]})")
+    print(f"  Players: {count} requests ({player_ids[0]} - {player_ids[-1]})")
     print(f"  Mode   : {mode}" + (f" (batch={batch_size}, delay={batch_delay}s)" if mode == "staggered" else ""))
     print("=" * 70)
     print()
 
     # Pre-flight: ensure server is alive
-    print("🔍 Pre-flight check …")
+    print("Pre-flight check ...")
     if not await preflight_check(base_url):
-        print("\n❌ Aborting — server is not reachable. Start it with: python main.py")
+        print("\nAborting - server is not reachable. Start it with: python main.py")
         sys.exit(1)
     print()
 
@@ -195,31 +195,31 @@ async def run_test(
 
         if mode == "burst":
             # ── Burst mode: all at once ──────────────────────────────
-            print(f"🚀 Phase 1: Firing ALL {count} requests simultaneously ...")
+            print(f"Phase 1: Firing ALL {count} requests simultaneously ...")
             print()
             all_results = await fire_batch(session, base_url, player_ids)
         else:
             # ── Staggered mode: batches with delay ───────────────────
             batches = [player_ids[i:i + batch_size] for i in range(0, len(player_ids), batch_size)]
             total_batches = len(batches)
-            print(f"🚀 Phase 1: Firing {count} requests in {total_batches} batches of ≤{batch_size} ...")
+            print(f"Phase 1: Firing {count} requests in {total_batches} batches of <= {batch_size} ...")
             print()
 
             for batch_num, batch in enumerate(batches, 0):
-                print(f"  📦 Batch {batch_num + 1}/{total_batches}: {', '.join(batch)}")
+                print(f"  Batch {batch_num + 1}/{total_batches}: {', '.join(batch)}")
                 batch_results = await fire_batch(session, base_url, batch, batch_num * batch_size)
 
                 for r in batch_results:
                     status_str = f"{r.status_code}" if r.status_code else "ERR"
                     body_str = r.body.get("status", r.error)[:40] if not r.error else r.error[:40]
-                    marker = "✅" if r.ok else "❌"
+                    marker = "OK" if r.ok else "ERR"
                     print(f"     {marker} {r.player_id:<10} HTTP {status_str:<5} {r.elapsed_ms:>8.0f} ms  {body_str}")
 
                 all_results.extend(batch_results)
 
                 # Only delay between batches, not after the last one
                 if batch_num < total_batches - 1:
-                    print(f"  ⏳ Waiting {batch_delay}s before next batch (rate limit cooldown) ...")
+                    print(f"  Waiting {batch_delay}s before next batch (rate limit cooldown) ...")
                     await asyncio.sleep(batch_delay)
                 print()
 
@@ -235,7 +235,7 @@ async def run_test(
             for r in all_results:
                 status_str = f"{r.status_code}" if r.status_code else "ERR"
                 body_str = r.body.get("status", r.error)[:45] if not r.error else r.error[:45]
-                marker = "✅" if r.ok else "❌"
+                marker = "OK" if r.ok else "ERR"
                 print(f"{marker} {r.player_id:<10} {status_str:<8} {r.elapsed_ms:>8.0f} ms   {body_str}")
             print()
 
@@ -245,13 +245,13 @@ async def run_test(
         print()
 
         if failures:
-            print("⚠️  FAILURES:")
+            print("FAILURES:")
             for r in failures:
-                print(f"   {r.player_id}: HTTP {r.status_code} — {r.error or r.body}")
+                print(f"   {r.player_id}: HTTP {r.status_code} - {r.error or r.body}")
             print()
 
         # ── Phase 2: Poll status ─────────────────────────────────────
-        print(f"🔍 Phase 2: Polling /hitl/v1/status for each player ...")
+        print(f"Phase 2: Polling /hitl/v1/status for each player ...")
         print()
 
         poll_tasks = []
@@ -265,34 +265,34 @@ async def run_test(
         pending_count = 0
         for s in statuses:
             decision = s.get("status", "?")
-            marker = "⏳" if decision in ("processing", "pending_human_review") else ("✅" if decision in ("approved", "rejected") else "❓")
+            marker = "PENDING" if decision in ("processing", "pending_human_review") else ("DONE" if decision in ("approved", "rejected") else "UNKNOWN")
             if decision in ("processing", "pending_human_review"):
                 pending_count += 1
-            print(f"  {marker} {s.get('player_id', '?'):<12} → {decision} (row: {s.get('row_number', '?')})")
+            print(f"  {marker:<7} {s.get('player_id', '?'):<12} -> {decision} (row: {s.get('row_number', '?')})")
 
         print()
         print(f"  Pending : {pending_count} / {count}")
         print()
 
         # ── Phase 3: Check sessions ──────────────────────────────────
-        print("📋 Phase 3: Fetching /sessions ...")
+        print("Phase 3: Fetching /sessions ...")
         sessions_data = await get_sessions(session, base_url)
         ses_count = sessions_data.get("count", "?")
-        ses_data = sessions_data.get("sessions", {})
+        ses_data = sessions_data.get("sessions", [])
         print(f"  Tracked sessions on server: {ses_count}")
         if ses_data:
-            for sid, stats in ses_data.items():
-                print(f"    • {sid} ({stats.get('status')})")
+            for stats in ses_data:
+                print(f"    - {stats.get('session_id', '?')} ({stats.get('status')})")
         print()
 
     # ── Final verdict ────────────────────────────────────────────────
     print("=" * 70)
     if len(successes) == count and pending_count == count:
-        print("✅ ALL TESTS PASSED — All requests succeeded and are pending review.")
+        print("ALL TESTS PASSED - All requests succeeded and are pending review.")
     elif len(successes) == count:
-        print("⚠️  All requests succeeded but some statuses are unexpected.")
+        print("All requests succeeded but some statuses are unexpected.")
     else:
-        print(f"❌ TEST FAILED — {len(failures)} request(s) did not succeed.")
+        print(f"TEST FAILED - {len(failures)} request(s) did not succeed.")
     print("=" * 70)
 
 

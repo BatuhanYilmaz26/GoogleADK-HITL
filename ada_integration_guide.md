@@ -18,7 +18,7 @@ Before configuring ADA, ensure your Google Sheet can talk back to your local ser
    ```javascript
    const WEBHOOK_URL = "https://<your-ngrok-url>.ngrok-free.app/webhook";
    ```
-4. Click **Save** and ensure you have the `onEdit` and `onChange` triggers set up as described in the README.
+4. Click **Save** and ensure you have the `onEdit` trigger set up as described in the README.
 
 > [!TIP]
 > The Apps Script now validates the webhook URL at runtime. If you forget to update it from the default `testurl.com` placeholder, it will log a warning and skip the webhook call instead of silently failing.
@@ -106,12 +106,12 @@ Below is the complete breakdown of all API statuses returned by the system:
 *   **`POST /hitl/v1/request_review`**
     *   `processing`: Returned instantly. The request was received and a sequence `session_id` was generated.
 *   **`GET /hitl/v1/status/session/{session_id}`** (ADA Polling)
-    *   `processing`: Request in memory, waiting to be written to Google Sheets.
+  *   `processing`: Request stored durably and waiting for a review worker to write to Google Sheets.
     *   `pending_human_review`: Row successfully appended; system is waiting for the human reviewer to enter a decision.
     *   `approved`: Human reviewer entered "Yes" (Column I).
     *   `rejected`: Human reviewer entered "No" or anything other than "Yes" (Column I).
-    *   `error`: Background task failed to write to Google Sheets.
-    *   `not_found`: `session_id` does not exist in memory.
+    *   `error`: The review job failed to write to Google Sheets.
+  *   `not_found`: `session_id` does not exist or has expired from retention cleanup.
 *   **`GET /hitl/v1/status/{player_id}/{row_number}`** (Legacy Polling)
     *   Same statuses as above, plus `not_found` if the lookup fails.
 
@@ -121,7 +121,7 @@ Below is the complete breakdown of all API statuses returned by the system:
 
 ### System & Admin Endpoints
 *   **`GET /health`**: Returns `ok` when server is alive.
-*   **`GET /sessions`**: Provides raw memory state of all tracked sessions.
+*   **`GET /sessions`**: Provides paginated persistent session state for admin inspection.
 
 ---
 
@@ -135,10 +135,10 @@ Below is the complete breakdown of all API statuses returned by the system:
 | `HTTP 403` on Sheet write                    | Service account doesn't have Editor access | Share the Google Sheet with the service account email as Editor       |
 | `HTTP 404` on Sheet write                    | Wrong `SPREADSHEET_ID` or `SHEET_NAME` | Double-check both values in `.env`                                  |
 | Webhook never fires                          | Apps Script triggers not set up            | Create installable triggers in Apps Script → Triggers                |
-| Webhook fires but 404                          | Server restarted since session was created | Normal — the correction fallback in `/webhook` handles this        |
+| Webhook fires but 404                          | Session expired or wrong webhook URL       | Usually means retention cleanup or a bad target URL; verify the active backend instance |
 | `⛔ WEBHOOK_URL is still set to the default` | Forgot to update Apps Script               | Replace `testurl.com` with your actual ngrok URL                    |
 | `ErrorLog` sheet has entries                 | All 3 webhook retries failed               | Check server is running; manually replay the decision                 |
-| Timestamp not appearing in Col B               | `onChange` trigger not configured        | Add an installable `onChange` trigger for the `onChange` function |
+| Timestamp not appearing in Col B               | Backend write failed before append         | Check server logs and `/metrics` for review job failures |
 | `pending` status never changes               | Notes (Col J) is empty                     | Both Decision AND Notes must be filled for the webhook to fire        |
 
 ### Server Logs to Look For
@@ -147,10 +147,10 @@ Below is the complete breakdown of all API statuses returned by the system:
 | ---------------------------------------------------- | ------------------------------------------- |
 | Log Message                                          | Meaning                                     |
 | ---------------------------------------------------- | ------------------------------------------- |
-| `🚀 Asynchronous HITL Payment Automation starting …` | Server booted successfully                  |
-| `🤖 ADA Request via Chatbot: player=...`           | ADA chatbot triggered a withdrawal          |
-| `⚙️ Background Task started`                       | Process background queued                   |
-| `📩 Webhook received: session=... decision=...`    | Human decision received from Apps Script    |
+| `Durable HITL Payment Automation starting`        | Server booted successfully                  |
+| `ADA Request via Chatbot: player=...`             | ADA chatbot triggered a withdrawal          |
+| `Review job started`                              | A worker claimed a queued Sheets write      |
+| `Webhook received: session=... decision=...`      | Human decision received from Apps Script    |
 
 ---
 
@@ -162,12 +162,12 @@ Use this checklist before your first end-to-end demonstration:
 - [ ] Health check returns OK: `GET /health`
 - [ ] ngrok tunnel is active and URL updated in Apps Script
 - [ ] Google Sheet is shared with the service account email (Editor role)
-- [ ] Apps Script has both `onEdit` and `onChange` installable triggers
+- [ ] Apps Script has the `onEdit` installable trigger
 - [ ] Column B is formatted as **Plain Text** (Format → Number → Plain Text)
 - [ ] Single request test: `POST /hitl/v1/request_review` returns `status: processing` and `session_id`
 - [ ] Sheet shows new row with Player ID, Name, and Channel
-- [ ] Timestamp appears automatically in Column B
-- [ ] Typing Decision + Notes fires webhook (check server logs for `📩`)
+- [ ] Timestamp is written automatically in Column B by the backend append
+- [ ] Typing Decision + Notes fires webhook (check server logs for `Webhook received`)
 - [ ] Poll status returns `"status": "approved"` with full `row_data`
 - [ ] Concurrency test passes: `python test_concurrent.py --count 10`
 
@@ -180,7 +180,7 @@ To ensure everything is working correctly:
 1. Run `python main.py` on your local machine.
 2. Trigger the flow via the ADA chatbot.
 3. Observe the server logs—you should see:
-   - `🤖 ADA Request via Chatbot: player=...`
-   - `⚙️  Background Task started`
+  - `ADA Request via Chatbot: player=...`
+  - `Review job started`
 4. Edit the Google Sheet (Columns I & J) and verify the chat updates.
 5. Check the `/metrics` endpoint for request counts and success rates.

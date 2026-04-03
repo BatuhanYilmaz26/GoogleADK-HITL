@@ -7,15 +7,15 @@ This document is a comprehensive guide to understanding the **Human-in-the-Loop 
 ## 1. Project Overview & Architecture
 
 ### The Goal
-The purpose of this system is to handle automated withdrawal requests from players (originating from a chatbot like Ada.cx) but with a mandatory **Human-in-the-Loop** step. The system operates as a zero-latency router.
+The purpose of this system is to handle automated withdrawal requests from players (originating from a chatbot like Ada.cx) but with a mandatory **Human-in-the-Loop** step. The system operates as a low-latency router with durable state.
 
 ### Core Flow
 1. **Trigger:** A chatbot (e.g., Ada) sends a withdrawal request to our Python server (`main.py`).
-2. **Fast Response:** The FastAPI server instantly creates an asynchronous `BackgroundTask`, generates a `session_id`, and returns `{"status": "processing", "session_id": "xyz"}` to the chatbot in under 10ms. This prevents the chatbot webhook from timing out.
-3. **Escalation (Background):** The background task safely acquires a Python Thread Lock and inserts a new pending row into a Google Spreadsheet (`sheets_service.py`), then updates its internal status to `pending_human_review`.
+2. **Fast Response:** The FastAPI server instantly generates a `session_id`, stores both the session and a queued review job in SQLite, and returns `{"status": "processing", "session_id": "xyz"}` to the chatbot.
+3. **Escalation (Workers):** Dedicated review workers claim queued jobs, append a new row into Google Sheets (`sheets_service.py`), then update the persisted session status to `pending_human_review`.
 4. **Human Action:** A human reviewer opens the Google Sheet, looks at the withdrawal request, and types "Yes" or "No" in the Decision column.
 5. **Webhook to Backend:** A Google Apps Script (`apps_script.js`) attached to the Spreadsheet detects this edit and immediately fires an HTTP payload (webhook) back to our Python server.
-6. **State Sync:** The Python server receives the webhook and instantly mutates the memory map `session_status[session_id]` to `approved` or `rejected` with the human notes. 
+6. **State Sync:** The Python server receives the webhook and updates the persistent session record to `approved` or `rejected` with the human notes. 
 7. **Final State:** The chatbot cleanly polls our server via `/hitl/v1/status/session/{session_id}` and retrieves the final status to deliver to the user.
 
 ---
@@ -29,9 +29,12 @@ The purpose of this system is to handle automated withdrawal requests from playe
 *   `pydantic`: Schema validation.
 
 ### Secure Sheets Client (`sheets_service.py`)
-Because the system is asynchronous and multi-threaded by nature (FastAPI concurrency), writing to the Google Sheet must be strictly controlled to prevent two requests hitting the exact same row.
+Because the system is asynchronous and multi-threaded by nature, the Google Sheets client must avoid shared `httplib2` state.
 
-*   **`threading.Lock()` (`_append_lock`)**: This lock ensures that if 50 withdrawal requests hit at once, they queue up single-file to update the Google Sheet safely. The delay is entirely hidden from the chatbot because of `BackgroundTasks`.
+*   **Fresh client per operation**: Each Sheets call builds its own API client, which avoids thread-safety issues in `google-api-python-client` on Windows.
+*   **Atomic append**: Rows are written with a single `values.append` call, so the backend does not need to scan `A5:K` to find the next empty row.
+*   **Backend timestamps**: Column B is written by the API itself, so Apps Script no longer needs a full-sheet `onChange` sweep.
+*   **Canonical sheet contract**: The integration uses operational columns B through K. Column A is ignored so sheet-specific helper values cannot shift the payload.
 
 ---
 
@@ -39,10 +42,11 @@ Because the system is asynchronous and multi-threaded by nature (FastAPI concurr
 
 `main.py` is the front door. 
 
-*   **`session_status: dict`**: An ultra-fast in-memory State Machine. It stores `{session_id: {"status": "...", "decision": "...", "notes": "..."}}`.
-*   **`/hitl/v1/request_review`**: Triggers the `process_withdrawal_background()` task. Returns `session_id` instantly.
-*   **`/hitl/v1/status/session/{session_id}`**: Polling endpoint. It returns exactly what exists in `session_status` at that exact millisecond.
-*   **`/webhook`**: Handles incoming HTTP POST requests from Google Apps Script to flip the boolean inside `session_status`.
+*   **`session_store.py`**: A persistent SQLite-backed state machine for both sessions and queued review jobs.
+*   **`/hitl/v1/request_review`**: Persists a new session and review job, then returns `session_id` instantly.
+*   **Review workers**: Background worker coroutines claim queued jobs and process Sheets writes without blocking request handlers.
+*   **`/hitl/v1/status/session/{session_id}`**: Polling endpoint. It returns the persisted session record.
+*   **`/webhook`**: Handles incoming HTTP POST requests from Google Apps Script and updates persistent state.
 
 ---
 
@@ -50,8 +54,8 @@ Because the system is asynchronous and multi-threaded by nature (FastAPI concurr
 
 Our final puzzle piece lives inside Google Sheets. Without this, the Python server would never know a human wrote "Yes" or "No".
 
-1.  **`onChange(e)`**: When the Python backend API writes a new row, this silently stamps the current Date/Time into Column B.
-2.  **`onEdit(e)`**: Whenever a user types something in the "Decision" or "Notes" column, it triggers. Once both are filled out, it grabs the hidden Session ID (Column K) and bundles a JSON payload. It uses `UrlFetchApp` with exponential retry bounds to dispatch the HTTP POST webhook back safely.
+1.  **`onEdit(e)`**: Whenever a user types something in the "Decision" or "Notes" column, it triggers. Once both are filled out, it grabs the hidden Session ID (Column K) and bundles the operational row payload from Columns B through J. It uses `UrlFetchApp` with exponential retry bounds to dispatch the HTTP POST webhook back safely.
+2.  **`onChange(e)`**: Retained as a compatibility no-op. Timestamping now happens in the backend append call.
 
 ---
 
@@ -59,5 +63,5 @@ Our final puzzle piece lives inside Google Sheets. Without this, the Python serv
 
 Due to the concurrency constraints of Google API limits, this file tortures the system safely.
 * It blasts `/hitl/v1/request_review` heavily.
-* Measures initial response time (guaranteeing sub-1s).
-* Continually pings `/hitl/v1/status/session/{session_id}` dynamically to ensure the server updates successfully as rows are locked and appended.
+* Measures initial response time while writes are queued durably.
+* Continually pings `/hitl/v1/status/session/{session_id}` dynamically to ensure the server updates successfully as workers append rows.

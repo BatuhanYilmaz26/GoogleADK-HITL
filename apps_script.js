@@ -3,26 +3,27 @@
  *
  * Paste this into Extensions → Apps Script in your Google Sheet.
  * It handles:
- *  1. onChange(e): Watches for backend API inserts and adds a timestamp to Column B.
- *  2. onEdit(e): Watches for Human Decision in Column I and sends a webhook to backend.
+ *  1. onEdit(e): Watches for Human Decision in Column I and sends a webhook to backend.
+ *  2. onChange(e): Optional no-op hook kept only for backward compatibility.
  *
  * IMPORTANT:
  *  1. Replace WEBHOOK_URL with your actual ngrok URL.
  *  2. If using WEBHOOK_SECRET, set it to match the .env value.
  *  3. This must be deployed as an "installable trigger"
  *     (Edit → Triggers → Add → onEdit) for UrlFetchApp to work.
- *     You will ALSO need an installable trigger for onChange.
  */
 
 // ─── Configuration ──────────────────────────────────────────────────
 
-const WEBHOOK_URL = "https://testurl.com/webhook"; // Replace with your ngrok(webhook) URL
+const WEBHOOK_URL = "https://testurl.com/webhook";
 const WEBHOOK_SECRET = "";  // Must match .env WEBHOOK_SECRET (leave "" to disable)
 
 // Column indices (1-based)
 const COL_SESSION_ID = 11;   // Column K (Hidden Session ID)
 const COL_DECISION = 9;   // Column I
 const COL_NOTES = 10;  // Column J
+const COL_PAYLOAD_START = 2; // Column B
+const COL_PAYLOAD_COUNT = 9; // Columns B through J
 
 // Retry settings for webhook delivery
 const WEBHOOK_MAX_RETRIES = 3;
@@ -82,47 +83,12 @@ function _logDeadLetter(row, sessionId, errorMsg) {
 // ─── Triggers ───────────────────────────────────────────────────────
 
 /**
- * Fires whenever the spreadsheet structure or content changes (including API edits).
- * Detects new Player ID insertions and adds timestamps.
- * Creates an Installable Trigger for "On change".
+ * Optional backward-compatible no-op hook.
+ * Timestamping is now handled directly by the backend append call, which avoids
+ * scanning the sheet on every insert.
  */
 function onChange(e) {
-  try {
-    var sheet = e.source.getActiveSheet();
-
-    // Skip if the edit is on the ErrorLog sheet
-    if (sheet.getName() === ERROR_LOG_SHEET) return;
-
-    var lastRow = sheet.getLastRow();
-
-    if (lastRow <= 4) return;
-
-    var startRow = 5;
-    var numRows = lastRow - startRow + 1;
-    if (numRows < 1) return;
-
-    // Range: from row `startRow`, 2nd column, for `numRows` rows, 2 columns wide (B and C)
-    var range = sheet.getRange(startRow, 2, numRows, 2);
-    var values = range.getValues();
-
-    var timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd, HH:mm:ss");
-
-    for (var i = 0; i < values.length; i++) {
-      var rowNum = startRow + i;
-      var bVal = values[i][0]; // Column B (Timestamp)
-      var cVal = values[i][1]; // Column C (Player ID)
-
-      // If Player ID exists but Timestamp is empty
-      if (cVal && !bVal) {
-        // NOTE: If your sheet formats B as a "Date", it may hide the comma or leading zeros.
-        // For best results, format Column B as 'Plain Text' in your Google Sheet.
-        sheet.getRange(rowNum, 2).setValue(timestamp);
-        Logger.log("Added timestamp for row " + rowNum);
-      }
-    }
-  } catch (err) {
-    Logger.log("onChange Error: " + err.message);
-  }
+  Logger.log("onChange hook invoked; timestamping is handled by the backend and no action is required.");
 }
 
 /**
@@ -160,14 +126,15 @@ function onEdit(e) {
       return;
     }
 
-    // Capture ALL column values (Columns A through J) for the ADA chatbot
-    var numCols = 10;
-    var fullRowData = sheet.getRange(row, 1, 1, numCols).getValues()[0];
+    // Capture the operational payload columns (B through J). Column A is not
+    // part of the integration contract and may contain sheet-specific helpers.
+    var fullRowData = sheet.getRange(row, COL_PAYLOAD_START, 1, COL_PAYLOAD_COUNT).getValues()[0];
 
-    // Convert Date objects to GMT+1 strings so they don't get stringified to GMT (Z)
+    // Convert Date objects to the spreadsheet timezone for stable ADA payloads.
+    var scriptTimezone = Session.getScriptTimeZone();
     for (var i = 0; i < fullRowData.length; i++) {
       if (Object.prototype.toString.call(fullRowData[i]) === '[object Date]') {
-        fullRowData[i] = Utilities.formatDate(fullRowData[i], "GMT+01:00", "yyyy-MM-dd, HH:mm:ss");
+        fullRowData[i] = Utilities.formatDate(fullRowData[i], scriptTimezone, "yyyy-MM-dd HH:mm:ss");
       }
     }
 
@@ -177,7 +144,7 @@ function onEdit(e) {
       decision: String(decision),
       notes: String(notes),
       row_number: Number(row),
-      row_data: fullRowData // Array of all columns A(0) to J(9)
+      row_data: fullRowData // Array of columns B(0) to J(8)
     };
 
     var options = {

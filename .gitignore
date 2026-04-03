@@ -7,6 +7,10 @@ ENV/
 .env
 service_account.json
 
+# Local Runtime State
+hitl_sessions.db
+hitl_sessions.db-*
+
 # Python Cache
 __pycache__/
 *.py[cod]

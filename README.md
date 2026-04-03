@@ -6,15 +6,15 @@
 
 ![HITL Automation](hitl_automation.png)
 
-This system delivers **end-to-end withdrawal automation** — from the moment a player requests a withdrawal in the chatbot, to the final decision being relayed back, with zero manual data entry in between.
+This system delivers **end-to-end withdrawal automation** - from the moment a player requests a withdrawal in the chatbot, to the final decision being relayed back, with zero manual data entry in between.
 
-- **Fast & Asynchronous**: Built with FastAPI Background Tasks to ensure sub-10ms response times for the chatbot, eliminating webhook timeouts.
+- **Fast & Durable**: The request path persists session and job state immediately, then dedicated workers process Google Sheets writes without blocking ADA.
 - **Chatbot-native**: Players initiate withdrawals directly through the ADA chatbot — no context switching for the player or the agent.
-- **Instant dashboard logging**: Every request is automatically written to the HITL Google Sheet with player details, timestamps, and session tracking.
+- **Instant dashboard logging**: Every request is appended to the HITL Google Sheet with player details, backend timestamps, and session tracking.
 - **Human-only decisions**: The system routes the requests and **never** approves or rejects a payment automatically — that authority stays with the human reviewer.
 - **Real-time feedback loop**: The moment a reviewer types their decision, the chatbot is updated within seconds via an automated webhook pipeline.
 - **Full audit trail**: Every request, decision, and note is captured with timestamps — ready for compliance and reporting.
-- **Concurrent & resilient**: Tested under simultaneous withdrawal requests with zero data loss.
+- **Concurrent & resilient**: Session state survives restarts, review jobs are recoverable, and writes avoid full-sheet scans as volume grows.
 
 ---
 
@@ -34,11 +34,9 @@ sequenceDiagram
     Player->>ADA: "I want to withdraw"
     ADA->>API: POST /hitl/v1/request_review
     API-->>ADA: {status: "processing", session_id: "xyz"}
-    Note right of API: Background Task runs concurrently
+    Note right of API: Session and review job are stored durably
     
-    API->>Sheet: Write row (Player ID, Name, Channel)
-    Sheet-->>Script: onChange trigger
-    Script->>Sheet: Stamp timestamp (Col B)
+    API->>Sheet: Append row (Timestamp, Player ID, Name, Channel)
 
     loop Every 10-15 seconds
         ADA->>API: GET /hitl/v1/status/session/{session_id}
@@ -64,13 +62,14 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 
 | Feature                           | File                      | Description                                                                                                                     |
 | --------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| **Sheets Retry**            | `sheets_service.py`     | Exponential backoff (up to 5 retries) for Sheets API 429/5xx errors.                                                            |
-| **Thread-Safe Singleton**   | `sheets_service.py`     | Double-checked locking prevents race conditions during Sheets API client initialization.                                        |
-| **Lock-Protected Append**   | `sheets_service.py`     | Employs a Python Semaphore/Lock to prevent concurrent Sheets appends from writing over each other.                               |
-| **Asynchronous Handoff**    | `main.py`               | Uses FastAPI `BackgroundTasks` to instantly respond to the Chatbot to prevent connection timeout.                           |
-| **Webhook Retry**           | `apps_script.js`        | Apps Script retries up to 3× with exponential backoff if the webhook fails.                                                    |
-| **Dead-Letter Logging**     | `apps_script.js`        | Failed webhooks after all retries are logged to a dedicated `ErrorLog` sheet tab — no human decision is ever silently lost.  |
-| **Operational Metrics**     | `main.py`               | `/metrics` endpoint tracks request counts, success/failure rates, and uptime for monitoring.                                  |
+| **Sheets Retry**            | `sheets_service.py`     | Exponential backoff covers both HTTP failures and transient transport errors such as Windows socket aborts.                    |
+| **Fresh Sheets Client**     | `sheets_service.py`     | Builds a new Google Sheets client per operation, avoiding cross-thread reuse of `httplib2.Http()`.                             |
+| **Atomic Sheets Append**    | `sheets_service.py`     | Uses a single `values.append` call instead of scanning `A5:K` to find the next row.                                           |
+| **Durable Session Store**   | `session_store.py`      | Persists session status in SQLite so polling, webhook updates, and restarts stay in sync.                                      |
+| **Durable Review Queue**    | `main.py`               | Review jobs are queued in SQLite and claimed by worker tasks, so requests are recoverable after restarts.                      |
+| **Backend Timestamping**    | `sheets_service.py`     | The API writes Column B directly, removing the expensive Apps Script full-sheet `onChange` scan.                               |
+| **Webhook Retry**           | `apps_script.js`        | Apps Script retries up to 3x with exponential backoff if the webhook fails.                                                    |
+| **Operational Metrics**     | `main.py`               | `/metrics` exposes queue depth, worker counts, session status counts, and review job outcomes.                                |
 
 ---
 
@@ -89,9 +88,16 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 ## Quick Start
 1. Clone & Setup Venv. Install requirements.
 2. Ensure you have the `.env` file populated.
-3. Configure your Google Service Account logic in `.env`.
+3. Share the Google Sheet with the service account email as an Editor.
 4. Run `python main.py`
 5. Expose localhost with ngrok: `ngrok http 8000`
+
+## Production Notes
+- Keep `REQUIRE_SERVICE_ACCOUNT=true` in production so writes never fall back to API-key mode.
+- Put `SESSION_DB_PATH` on a durable disk path that survives restarts and deployments.
+- Tune `REVIEW_WORKER_COUNT` carefully against Google Sheets quota rather than CPU core count.
+- Set `CORS_ALLOW_ORIGINS` to the exact ADA domains you expect instead of `*`.
+- Only the Apps Script `onEdit` trigger is required now; backend writes Column B timestamps directly.
 
 ### Testing
 ```powershell
