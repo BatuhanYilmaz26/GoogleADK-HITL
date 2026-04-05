@@ -27,7 +27,7 @@ Before configuring ADA, ensure your Google Sheet can talk back to your local ser
 
 ## 2. ADA Action 1: Trigger Withdrawal Request
 
-This action initializes the process and writes a row to Google Sheets.
+This action initializes the process by creating a durable session and queueing a Sheets append job. A review worker then appends the row to Google Sheets asynchronously.
 
 ### **Endpoint Tab**
 
@@ -54,11 +54,14 @@ This action initializes the process and writes a row to Google Sheets.
 
   *(Ensure `[player_id]` and `[player_name]` are mapped to your ADA variables.)*
 
+  The backend also accepts `playerUid` and will use it in preference to `player_id` if both fields are present.
+
 ### **Response Handling**
 
 ADA needs to capture the `session_id` from the API response to use in the polling step.
 
 - Map the JSON key `session_id` to a new ADA variable named `meta_session_id`.
+- Expect the initial API response to be `status: processing` while the queued Google Sheets append is still being handled by a worker.
 
 ---
 
@@ -138,9 +141,9 @@ Below is the complete breakdown of all API statuses returned by the system:
 | Webhook fires but 404                          | Session expired or wrong webhook URL       | Usually means retention cleanup or a bad target URL; verify the active backend instance |
 | `⛔ WEBHOOK_URL is still set to the default` | Forgot to update Apps Script               | Replace `testurl.com` with your actual ngrok URL                    |
 | `ErrorLog` sheet has entries                 | All 3 webhook retries failed               | Check server is running; manually replay the decision                 |
+| Status remains `processing` for too long     | Worker backlog or Sheets write failure     | Check `/health`, `/metrics`, and logs for queue depth or review job failures |
 | Timestamp not appearing in Col B               | Backend write failed before append         | Check server logs and `/metrics` for review job failures |
 | Status remains `pending_human_review` for too long | Webhook did not arrive yet or human review is incomplete | Ensure both Decision and Notes are filled; the status endpoint only reconciles pending rows periodically to protect Sheets quota |
-| `pending_human_review` status never changes | Notes (Col J) is empty or the human decision is incomplete | Both Decision AND Notes must be filled for the webhook to fire        |
 
 ### Server Logs to Look For
 
@@ -165,7 +168,7 @@ Use this checklist before your first end-to-end demonstration:
 - [ ] Apps Script has the `onEdit` installable trigger
 - [ ] Column B is formatted as **Plain Text** (Format → Number → Plain Text)
 - [ ] Single request test: `POST /hitl/v1/request_review` returns `status: processing` and `session_id`
-- [ ] Sheet shows new row with Player ID, Name, and Channel
+- [ ] Sheet shows new row with Player ID, Name, and Channel after the queued worker processes the request
 - [ ] Timestamp is written automatically in Column B by the backend append in GMT+2
 - [ ] Typing Decision + Notes fires webhook (check server logs for `Webhook received`)
 - [ ] Poll status returns `"status": "approved"` with full `row_data`

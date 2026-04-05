@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import socket
 import ssl
@@ -94,6 +95,8 @@ def _log_auth_mode_once(*, using_service_account: bool, sa_path: str) -> None:
 
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0  # seconds
+MAX_BACKOFF = 32.0  # seconds
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 TRANSIENT_NETWORK_ERRORS = (
     ConnectionError,
@@ -107,23 +110,22 @@ TRANSIENT_NETWORK_ERRORS = (
 
 def _retry_api_call(fn: Callable[[], Any], *, description: str = "API call"):
     """
-    Execute *fn()* with exponential backoff on 429/5xx errors.
+    Execute *fn()* with truncated exponential backoff and jitter.
 
     Returns the result of fn() on success, raises on exhaustion.
     """
-    backoff = INITIAL_BACKOFF
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn()
         except HttpError as exc:
             status = exc.resp.status if exc.resp else 0
-            if status in (429, 500, 502, 503) and attempt < MAX_RETRIES:
+            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_RETRIES:
+                delay = _compute_retry_delay(attempt)
                 logger.warning(
                     "%s failed (HTTP %d), retrying in %.1fs (attempt %d/%d)",
-                    description, status, backoff, attempt, MAX_RETRIES,
+                    description, status, delay, attempt, MAX_RETRIES,
                 )
-                time.sleep(backoff)
-                backoff *= 2
+                time.sleep(delay)
             elif status == 403:
                 logger.error(
                     "%s returned HTTP 403 - Permission denied. "
@@ -142,20 +144,27 @@ def _retry_api_call(fn: Callable[[], Any], *, description: str = "API call"):
                 raise
         except TRANSIENT_NETWORK_ERRORS as exc:
             if attempt < MAX_RETRIES:
+                delay = _compute_retry_delay(attempt)
                 logger.warning(
                     "%s failed (%s: %s), retrying in %.1fs (attempt %d/%d)",
                     description,
                     type(exc).__name__,
                     exc,
-                    backoff,
+                    delay,
                     attempt,
                     MAX_RETRIES,
                 )
-                time.sleep(backoff)
-                backoff *= 2
+                time.sleep(delay)
             else:
                 raise
     raise RuntimeError(f"{description} failed after {MAX_RETRIES} retries")
+
+
+def _compute_retry_delay(attempt: int) -> float:
+    """Return a Google-style truncated exponential backoff delay with jitter."""
+    exponential_delay = INITIAL_BACKOFF * (2 ** (attempt - 1))
+    jitter = random.uniform(0.0, 1.0)
+    return min(exponential_delay + jitter, MAX_BACKOFF)
 
 
 # ── Concurrency limiter ──────────────────────────────────────────────

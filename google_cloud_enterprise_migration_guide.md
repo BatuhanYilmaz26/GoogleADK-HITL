@@ -615,6 +615,14 @@ Default Sheets API quotas per project:
 
 At 10,000 active players polling every 10–15 seconds, raw status polling generates ~700–1,000 requests per second if every poll hit the Sheets API. The backend already avoids this because status polling reads from the local SQLite database, not from Google Sheets.
 
+Additional Google Sheets API behaviors verified from Google developer documentation:
+
+- Sheets API quotas are refilled every minute, not once per day.
+- Google recommends keeping API payloads around 2 MB or less for speed and reliability.
+- A single Sheets API request can time out after 180 seconds of processing.
+- Each batch request counts as one API request against quota, even if it contains multiple subrequests.
+- Provided the per-minute quotas are respected, there is no separate daily request cap for the Sheets API.
+
 ### The reconciliation problem
 
 The reconciliation path (`GET /hitl/v1/status/session/{session_id}`) previously called `sheets_service.get_review_row()` on every poll for any pending session. At 10K scale, even a small fraction of pending sessions would exhaust the Sheets read quota immediately.
@@ -681,6 +689,31 @@ Recommended operational practices:
 - Shard active review sheets by date, team, or region if needed
 - Use protected headers and data validation in the Decision column
 - Set conditional formatting on the review sheet sparingly
+
+### 15.8 Cloud Tasks and Cloud Run limits that matter for the target architecture
+
+Official Google Cloud product limits that are especially relevant to this migration plan:
+
+**Cloud Tasks**:
+- Default maximum number of queues: 1,000 per region
+- API requests quota: 6,000,000 per minute per region
+- Queue dispatch rate system limit: 500 tasks per second per queue
+- Maximum task size: 1 MiB
+- Maximum task retention: 31 days
+- Maximum schedule time for a task: 30 days in the future
+- Task deduplication window: up to 24 hours
+
+**Cloud Run**:
+- Maximum services: 1,000 per project and region
+- Maximum jobs: 1,000 per project and region
+- Maximum running job executions: 1,000 per project and region
+- Maximum concurrent requests per instance: 1,000
+- Maximum request timeout: 60 minutes
+- Cloud Run Admin API read requests: 3,000 per 60 seconds per region
+- Cloud Run Admin API write requests: 180 per 60 seconds per region
+- Job run quota: 180 per 60 seconds per region
+
+These limits reinforce the architecture choice: Cloud Run and Cloud Tasks are materially more scalable than Google Sheets for this workflow, so the sheet should remain the human review interface, not the main state or throughput bottleneck.
 
 ## 16. Demo Code Optimizations and Enterprise Mapping
 
@@ -763,6 +796,10 @@ Use the following load test patterns before production:
 | Polling scalability | `k6` with sustained connections | 10K concurrent GET requests to status endpoint |
 | Webhook delivery under failure | Manual or chaos testing | Kill Cloud Run mid-webhook; verify retry and recovery |
 | Database connection saturation | `pgbench` or application load | Cloud SQL at max Cloud Run instances |
+
+Important interpretation note:
+- The current repository's `test_concurrent.py` validates the local FastAPI + SQLite + Google Sheets path.
+- It is useful for demo readiness, but it is not a substitute for a true Cloud Run, Cloud Tasks, and Cloud SQL load test after migration.
 
 ## 18. Cost Estimation
 
@@ -852,16 +889,30 @@ These are the confirmed operational limits relevant to this workflow:
 | Limit | Value | Source |
 | --- | --- | --- |
 | Sheets API read requests | 300 per minute per project (default) | Google Cloud quotas |
+| Sheets API read requests | 60 per minute per user per project | Google Cloud quotas |
 | Sheets API write requests | 300 per minute per project (default) | Google Cloud quotas |
+| Sheets API write requests | 60 per minute per user per project | Google Cloud quotas |
+| Recommended API payload size | ~2 MB | Google Sheets API guidance |
+| Maximum processing time for one Sheets API request | 180 seconds | Google Sheets API guidance |
 | Cells per spreadsheet | 10,000,000 | Google Sheets limits |
 | Columns per sheet | 18,278 | Google Sheets limits |
 | Characters per cell | 50,000 | Google Sheets limits |
 | Apps Script daily triggers | 20 per user per script (time-driven); event-driven are not limited by this | Apps Script quotas |
 | Apps Script execution time | 6 minutes per execution | Apps Script quotas |
+| Apps Script simultaneous executions per script | 1,000 | Apps Script quotas |
 | `UrlFetchApp` daily quota | 20,000 calls per day (consumer); 100,000 (Workspace) | Apps Script quotas |
 | `UrlFetchApp` per execution | No hard limit, but constrained by 6-minute execution time | Apps Script quotas |
+| Cloud Tasks queue dispatch rate | 500 tasks per second per queue | Cloud Tasks system limits |
+| Cloud Tasks max task size | 1 MiB | Cloud Tasks system limits |
+| Cloud Tasks max retention | 31 days | Cloud Tasks system limits |
+| Cloud Run services | 1,000 per project and region | Cloud Run limits |
+| Cloud Run jobs | 1,000 per project and region | Cloud Run limits |
+| Cloud Run max request timeout | 60 minutes | Cloud Run limits |
+| Cloud Run max concurrent requests per instance | 1,000 | Cloud Run limits |
 
 At 500 withdrawal decisions per day, the `UrlFetchApp` quota is not a concern. At 10K+ decisions per day, Google Workspace edition matters.
+
+Quotas and limits change over time. Re-check the live Google documentation before an implementation phase, quota increase request, or shareholder presentation that quotes exact numbers.
 
 ## 22. Summary of Changes Made to Demo Codebase
 

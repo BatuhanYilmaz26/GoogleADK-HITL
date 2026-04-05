@@ -34,6 +34,7 @@ Because the system is asynchronous and multi-threaded by nature, the Google Shee
 
 *   **Thread-local client cache**: Each worker thread keeps its own cached Sheets client for `SHEETS_CLIENT_TTL_SECONDS`, so `httplib2.Http()` is never shared across threads.
 *   **Semaphore-based rate limiting**: All Sheets reads and writes pass through a concurrency limiter before retry logic, which reduces the chance of hitting Sheets API quotas under load.
+*   **Google-style retry behavior**: Retryable Sheets failures use truncated exponential backoff with jitter instead of deterministic doubling, which is safer when multiple workers hit quota or transient failures at the same time.
 *   **Atomic append**: Rows are written with a single `values.append` call, so the backend does not need to scan `A5:K` to find the next empty row.
 *   **Backend timestamps**: Column B is written by the API itself in GMT+2, so Apps Script no longer needs a full-sheet `onChange` sweep.
 *   **Canonical sheet contract**: The integration uses operational columns B through K. Column A is ignored so sheet-specific helper values cannot shift the payload.
@@ -49,6 +50,9 @@ Because the system is asynchronous and multi-threaded by nature, the Google Shee
 *   **Review workers**: Background worker coroutines claim queued jobs and process Sheets writes without blocking request handlers.
 *   **`/hitl/v1/status/session/{session_id}`**: Polling endpoint. It returns the persisted session record and can reconcile pending rows from Google Sheets on a per-session cooldown.
 *   **`/webhook`**: Handles incoming HTTP POST requests from Google Apps Script and updates persistent state using timing-safe secret comparison.
+*   **Interactive docs**: The FastAPI app exposes Swagger UI at `/docs` and ReDoc at `/redoc`.
+*   **CORS behavior**: Allowed origins and credential behavior come from `config.py` and are applied through FastAPI's `CORSMiddleware`.
+*   **Player ID compatibility**: The chatbot request model accepts either `playerUid` or `player_id` and normalizes them into the stored player identifier.
 
 ### Durable SQLite Store (`session_store.py`)
 
@@ -57,6 +61,7 @@ The demo uses SQLite as both a session store and a durable review-job queue.
 *   **WAL mode**: Enables strong concurrent read behavior.
 *   **Tuned pragmas**: `busy_timeout`, page-cache sizing, and `mmap_size` improve stability under concurrent access.
 *   **Indexed cleanup path**: Session cleanup runs against an index on `updated_at` instead of forcing a full table scan as row counts grow.
+*   **Companion WAL files**: While the app is running, SQLite may create `hitl_sessions.db-wal` and `hitl_sessions.db-shm`; those files are expected parts of the same database.
 
 ### Configuration (`config.py`)
 
@@ -70,6 +75,19 @@ Key runtime controls:
 *   `SESSION_RETENTION_HOURS`
 *   `SESSION_CLEANUP_INTERVAL_SECONDS`
 *   `WEBHOOK_SECRET`
+
+### Endpoint Inventory
+
+The current HTTP surface is broader than the main ADA flow:
+
+*   **`POST /hitl/v1/request_review`**: Primary chatbot entry point.
+*   **`GET /hitl/v1/status/session/{session_id}`**: Primary polling path.
+*   **`GET /hitl/v1/status/{player_id}/{row_number}`**: Legacy polling path.
+*   **`POST /webhook`**: Apps Script callback endpoint.
+*   **`GET /health`**: Health and queue summary.
+*   **`GET /metrics`**: Runtime counters and queue/session aggregates.
+*   **`GET /sessions`**: Admin inspection with pagination and optional status filtering.
+*   **`POST /test/withdrawal`**: Manual test helper that lets a caller supply a fixed `session_id`.
 
 ---
 

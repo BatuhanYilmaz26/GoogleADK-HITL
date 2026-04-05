@@ -1,6 +1,6 @@
 # HITL Payment Automation — FastAPI + Google Sheets
 
-![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)
 
 ## Overview
 
@@ -27,16 +27,20 @@ sequenceDiagram
     participant Player
     participant ADA as ADA Chatbot
     participant API as FastAPI Server
+  participant Store as SQLite Store
+  participant Worker as Review Worker
     participant Sheet as Google Sheet
     participant Human as Human Reviewer
     participant Script as Apps Script
 
     Player->>ADA: "I want to withdraw"
     ADA->>API: POST /hitl/v1/request_review
+  API->>Store: Create session + enqueue review job
     API-->>ADA: {status: "processing", session_id: "xyz"}
-    Note right of API: Session and review job are stored durably
+  Note right of API: Request returns immediately after durable persistence
     
-    API->>Sheet: Append row (Timestamp, Player ID, Name, Channel)
+  Worker->>Store: Claim queued review job
+  Worker->>Sheet: Append row (GMT+2 Timestamp, Player ID, Name, Channel)
 
     loop Every 10-15 seconds
         ADA->>API: GET /hitl/v1/status/session/{session_id}
@@ -46,7 +50,7 @@ sequenceDiagram
     Human->>Sheet: Types "Yes" in Col I, notes in Col J
     Sheet-->>Script: onEdit trigger
     Script->>API: POST /webhook {decision, notes, row_data}
-    API->>API: Updates session dictionary
+    API->>Store: Update session state
     API-->>Script: 200 OK
 
     ADA->>API: GET /hitl/v1/status/session/{session_id}
@@ -62,7 +66,7 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 
 | Feature                           | File                      | Description                                                                                                                     |
 | --------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| **Sheets Retry**            | `sheets_service.py`     | Exponential backoff covers both HTTP failures and transient transport errors such as Windows socket aborts.                    |
+| **Sheets Retry**            | `sheets_service.py`     | Truncated exponential backoff with jitter covers quota spikes, 5xx responses, and transient transport errors such as Windows socket aborts.                    |
 | **Thread-Local Sheets Client Cache** | `sheets_service.py` | Reuses a cached Sheets client per thread with a TTL, avoiding cross-thread reuse of `httplib2.Http()` without rebuilding the client on every call. |
 | **Sheets Concurrency Limit** | `sheets_service.py` | Limits concurrent Sheets API calls with a semaphore so worker bursts and reconciliation reads do not overwhelm API quota. |
 | **Atomic Sheets Append**    | `sheets_service.py`     | Uses a single `values.append` call instead of scanning `A5:K` to find the next row.                                           |
@@ -81,7 +85,7 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 
 | Layer                            | Implementation                                                                                     |
 | -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| **Webhook Authentication** | Shared secret (`WEBHOOK_SECRET`) in HTTP header, validated by FastAPI middleware                 |
+| **Webhook Authentication** | Shared secret (`WEBHOOK_SECRET`) in `X-Webhook-Secret`, validated inside the `/webhook` handler with constant-time comparison |
 | **Sheets API Auth**        | Service account with narrow scope (`spreadsheets` only) — no OAuth user consent needed          |
 | **Credential Management**  | All secrets in `.env` (gitignored), service account key in `service_account.json` (gitignored) |
 | **CORS**                   | Configurable middleware — restrict to specific domains in production                              |
@@ -95,6 +99,7 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 3. Share the Google Sheet with the service account email as an Editor.
 4. Run `python main.py`
 5. Expose localhost with ngrok: `ngrok http 8000`
+6. Open `http://localhost:8000/docs` or `http://localhost:8000/redoc` to inspect the live FastAPI surface.
 
 ## Production Notes
 - Keep `REQUIRE_SERVICE_ACCOUNT=true` in production so writes never fall back to API-key mode.
@@ -105,6 +110,7 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 - Tune `RECONCILIATION_COOLDOWN_SECONDS` high enough that ADA polling cannot turn into sustained Sheets read pressure.
 - Set `CORS_ALLOW_ORIGINS` to the exact ADA domains you expect instead of `*`.
 - Only the Apps Script `onEdit` trigger is required now; backend writes Column B timestamps directly in GMT+2.
+- SQLite WAL mode intentionally creates `hitl_sessions.db`, `hitl_sessions.db-wal`, and `hitl_sessions.db-shm` while the app is active; those files belong to the same database and should not be deleted manually.
 
 ## Recommended Profiles
 
@@ -139,6 +145,25 @@ The values in `.env.example` are demo-oriented starter defaults. If you want cle
 - Update `apps_script.js` with the active `/webhook` URL and the same `WEBHOOK_SECRET` value.
 - Install the Apps Script `onEdit` trigger and confirm the `ErrorLog` sheet is empty after a test run.
 - Verify `/health`, `/metrics`, one end-to-end append, and one end-to-end human decision before presenting the demo.
+
+## API Surface
+
+The current FastAPI application exposes the following endpoints:
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/hitl/v1/request_review` | `POST` | Main ADA chatbot entry point. Creates a durable session, queues a review job, and returns `status: processing` immediately. |
+| `/hitl/v1/status/session/{session_id}` | `GET` | Primary polling endpoint. Returns the persisted session and can reconcile pending rows from Google Sheets on a cooldown. |
+| `/hitl/v1/status/{player_id}/{row_number}` | `GET` | Legacy lookup path for older integrations that still key status checks by player ID and row number. |
+| `/webhook` | `POST` | Receives Apps Script callbacks after a human reviewer fills Decision and Notes. |
+| `/health` | `GET` | Lightweight health and queue-depth check for operations and demos. |
+| `/metrics` | `GET` | Operational counters, queue depth, worker count, session status counts, and job counts. |
+| `/sessions` | `GET` | Admin/debug endpoint with pagination and optional `status` filtering. |
+| `/test/withdrawal` | `POST` | Manual test endpoint that accepts a caller-provided `session_id`. Useful for local verification and scripted testing. |
+
+Notes:
+- `/sessions` supports `limit`, `offset`, and `status` query parameters.
+- `/test/withdrawal` is a testing helper, not the primary ADA integration path.
 
 ### Testing
 ```powershell
