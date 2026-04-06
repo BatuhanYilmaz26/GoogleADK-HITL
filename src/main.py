@@ -4,6 +4,8 @@ main.py - FastAPI server with durable HITL queue workers and webhook endpoints.
 Run with:
     python -m src.main
 or:
+    python src/main.py
+or:
     uvicorn src.main:app --host 0.0.0.0 --port 8000
 """
 
@@ -12,16 +14,22 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import sys
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Allow direct script execution via `python src/main.py`.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import config, session_store, sheets_service
 
