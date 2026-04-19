@@ -97,6 +97,8 @@ MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0  # seconds
 MAX_BACKOFF = 32.0  # seconds
 RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+FIRST_REVIEW_ROW = 5
+REVIEW_ROW_WIDTH = 10
 
 TRANSIENT_NETWORK_ERRORS = (
     ConnectionError,
@@ -187,6 +189,52 @@ def _sheet_timestamp() -> str:
     return datetime.now(_sheet_timezone).strftime("%Y-%m-%d %H:%M:%S GMT+2")
 
 
+def _normalize_review_row(row_values: list[Any]) -> list[Any]:
+    padded_row = list(row_values)
+    if len(padded_row) < REVIEW_ROW_WIDTH:
+        padded_row.extend([""] * (REVIEW_ROW_WIDTH - len(padded_row)))
+    return padded_row[:REVIEW_ROW_WIDTH]
+
+
+def _build_review_row_snapshot(row_values: list[Any], row_number: int) -> dict[str, Any]:
+    padded_row = _normalize_review_row(row_values)
+    row_data = padded_row[:9]
+    return {
+        "row_number": row_number,
+        "row_data": row_data,
+        "decision": str(row_data[7]).strip() if row_data[7] is not None else "",
+        "notes": str(row_data[8]).strip() if row_data[8] is not None else "",
+        "session_id": str(padded_row[9]).strip() if padded_row[9] is not None else "",
+    }
+
+
+def find_pending_review_row_for_player(player_id: str) -> dict[str, Any] | None:
+    normalized_player_id = str(player_id or "").strip()
+    if not normalized_player_id:
+        return None
+
+    result = _rate_limited_api_call(
+        lambda: get_sheets_service().spreadsheets().values().get(
+            spreadsheetId=config.SPREADSHEET_ID,
+            range=f"{config.SHEET_NAME}!B{FIRST_REVIEW_ROW}:K",
+        ).execute(),
+        description=f"Find pending review row for player {normalized_player_id}",
+    )
+
+    values = result.get("values", [])
+    latest_match: dict[str, Any] | None = None
+    for row_number, row_values in enumerate(values, start=FIRST_REVIEW_ROW):
+        snapshot = _build_review_row_snapshot(row_values, row_number)
+        existing_player_id = str(snapshot["row_data"][1]).strip() if len(snapshot["row_data"]) > 1 else ""
+        if existing_player_id != normalized_player_id:
+            continue
+        if snapshot["decision"]:
+            continue
+        latest_match = snapshot
+
+    return latest_match
+
+
 def append_review_row(
     session_id: str,
     player_id: str,
@@ -262,17 +310,9 @@ def get_review_row(row_number: int) -> dict[str, Any] | None:
     if not values:
         return None
 
-    padded_row = list(values[0])
-    if len(padded_row) < 10:
-        padded_row.extend([""] * (10 - len(padded_row)))
-
-    row_data = padded_row[:9]
-    return {
-        "row_data": row_data,
-        "decision": str(row_data[7]).strip() if row_data[7] is not None else "",
-        "notes": str(row_data[8]).strip() if row_data[8] is not None else "",
-        "session_id": str(padded_row[9]).strip() if padded_row[9] is not None else "",
-    }
+    snapshot = _build_review_row_snapshot(values[0], row_number)
+    snapshot.pop("row_number", None)
+    return snapshot
 
 
 def _extract_row_number(result: dict[str, Any]) -> int:

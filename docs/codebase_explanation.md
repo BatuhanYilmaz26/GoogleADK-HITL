@@ -11,8 +11,8 @@ The purpose of this system is to handle automated withdrawal requests from playe
 
 ### Core Flow
 1. **Trigger:** A chatbot (e.g., Ada) sends a withdrawal request to our Python server (`src/main.py`).
-2. **Fast Response:** The FastAPI server instantly generates a `session_id`, stores both the session and a queued review job in SQLite, and returns `{"status": "processing", "session_id": "xyz"}` to the chatbot.
-3. **Escalation (Workers):** Dedicated review workers claim queued jobs, append a new row into Google Sheets (`src/sheets_service.py`), then update the persisted session status to `pending_human_review`.
+2. **Fast Response:** The FastAPI server instantly generates a `session_id`, stores the session in SQLite, synchronously checks Google Sheets for an existing blank-decision row for that player, and either returns `{"status": "pending_human_review", "duplicate_request_suppressed": true, ...}` immediately or queues a new write and returns `{"status": "processing", "session_id": "xyz"}`.
+3. **Escalation (Workers):** Dedicated review workers only claim queued jobs for non-duplicate requests. They append a new row into Google Sheets (`src/sheets_service.py`) and then update the persisted session status to `pending_human_review`. As a fallback, the worker still rechecks for an existing pending row before append.
 4. **Human Action:** A human reviewer opens the Google Sheet, looks at the withdrawal request, and types "Yes" or "No" in the Decision column.
 5. **Webhook to Backend:** A Google Apps Script (`src/apps_script.js`) attached to the Spreadsheet detects this edit and immediately fires an HTTP payload (webhook) back to our Python server.
 6. **State Sync:** The Python server receives the webhook and updates the persistent session record to `approved` or `rejected` with the human notes. 
@@ -36,6 +36,7 @@ Because the system is asynchronous and multi-threaded by nature, the Google Shee
 *   **Semaphore-based rate limiting**: All Sheets reads and writes pass through a concurrency limiter before retry logic, which reduces the chance of hitting Sheets API quotas under load.
 *   **Google-style retry behavior**: Retryable Sheets failures use truncated exponential backoff with jitter instead of deterministic doubling, which is safer when multiple workers hit quota or transient failures at the same time.
 *   **Atomic append**: Rows are written with a single `values.append` call, so the backend does not need to scan `A5:K` to find the next empty row.
+*   **Pending duplicate suppression**: The request path checks the operational sheet for the same Player ID with a blank Decision column before queueing a write, and the worker rechecks before append as a fallback. If found, the new session reuses that existing row instead of creating a duplicate review item.
 *   **Backend timestamps**: Column B is written by the API itself in GMT+2, so Apps Script no longer needs a full-sheet `onChange` sweep.
 *   **Canonical sheet contract**: The integration uses operational columns B through K. Column A is ignored so sheet-specific helper values cannot shift the payload.
 
@@ -46,7 +47,7 @@ Because the system is asynchronous and multi-threaded by nature, the Google Shee
 `src/main.py` is the front door. 
 
 *   **`src/session_store.py`**: A persistent SQLite-backed state machine for both sessions and queued review jobs.
-*   **`/hitl/v1/request_review`**: Persists a new session and review job, then returns `session_id` instantly.
+*   **`/hitl/v1/request_review`**: Persists a new session, then either queues a review job or immediately links the session to an existing pending sheet row for the same player and returns `duplicate_request_suppressed` metadata.
 *   **Review workers**: Background worker coroutines claim queued jobs and process Sheets writes without blocking request handlers.
 *   **`/hitl/v1/status/session/{session_id}`**: Polling endpoint. It returns the persisted session record and can reconcile pending rows from Google Sheets on a per-session cooldown.
 *   **`/webhook`**: Handles incoming HTTP POST requests from Google Apps Script and updates persistent state using timing-safe secret comparison.

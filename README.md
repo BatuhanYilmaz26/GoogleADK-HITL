@@ -8,12 +8,12 @@
 
 This system delivers **end-to-end withdrawal automation** - from the moment a player requests a withdrawal in the chatbot, to the final decision being relayed back, with zero manual data entry in between.
 
-- **Fast & Durable**: The request path persists session and job state immediately, then dedicated workers process Google Sheets writes without blocking ADA.
+- **Fast & Durable**: The request path persists session state immediately, then either queues a Google Sheets write or instantly links the new session to an existing pending row for the same player.
 - **Chatbot-native**: Players initiate withdrawals directly through the ADA chatbot — no context switching for the player or the agent.
-- **Instant dashboard logging**: Every request is appended to the HITL Google Sheet with player details, backend GMT+2 timestamps, and session tracking.
+- **Instant dashboard logging**: New requests are appended to the HITL Google Sheet unless the same player already has a pending blank-decision row, in which case the new session links to the existing review row.
 - **Human-only decisions**: The system routes the requests and **never** approves or rejects a payment automatically — that authority stays with the human reviewer.
 - **Real-time feedback loop**: The moment a reviewer types their decision, the chatbot is updated within seconds via an automated webhook pipeline.
-- **Full audit trail**: Every request, decision, and note is captured with timestamps — ready for compliance and reporting.
+- **Full audit trail**: Every session, review-row decision, and note is captured with timestamps — ready for compliance and reporting.
 - **Concurrent & resilient**: Session state survives restarts, review jobs are recoverable, and writes avoid full-sheet scans as volume grows.
 
 ---
@@ -35,12 +35,19 @@ sequenceDiagram
 
     Player->>ADA: "I want to withdraw"
     ADA->>API: POST /hitl/v1/request_review
-  API->>Store: Create session + enqueue review job
-    API-->>ADA: {status: "processing", session_id: "xyz"}
-  Note right of API: Request returns immediately after durable persistence
-    
-  Worker->>Store: Claim queued review job
-  Worker->>Sheet: Append row (GMT+2 Timestamp, Player ID, Name, Channel)
+  API->>Store: Create session
+  API->>Sheet: Check for existing blank-decision row
+      alt duplicate pending row already exists
+        API->>Store: Link session to existing pending row
+        API-->>ADA: {status: "pending_human_review", session_id: "xyz", duplicate_request_suppressed: true}
+        Note right of API: Existing blank-decision row reused for the same player
+      else no pending row exists
+        API->>Store: Enqueue review job
+        API-->>ADA: {status: "processing", session_id: "xyz"}
+        Note right of API: Request returns immediately after durable persistence
+        Worker->>Store: Claim queued review job
+        Worker->>Sheet: Append row (GMT+2 Timestamp, Player ID, Name, Channel)
+      end
 
     loop Every 10-15 seconds
         ADA->>API: GET /hitl/v1/status/session/{session_id}
@@ -49,7 +56,7 @@ sequenceDiagram
 
     Human->>Sheet: Types "Yes" in Col I, notes in Col J
     Sheet-->>Script: onEdit trigger
-    Script->>API: POST /webhook {decision, notes, row_data}
+    Script->>API: POST /webhook {session_id, decision, notes, row_number, row_data}
     API->>Store: Update session state
     API-->>Script: 200 OK
 
@@ -70,6 +77,7 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 | **Thread-Local Sheets Client Cache** | `src/sheets_service.py` | Reuses a cached Sheets client per thread with a TTL, avoiding cross-thread reuse of `httplib2.Http()` without rebuilding the client on every call. |
 | **Sheets Concurrency Limit** | `src/sheets_service.py` | Limits concurrent Sheets API calls with a semaphore so worker bursts and reconciliation reads do not overwhelm API quota. |
 | **Atomic Sheets Append**    | `src/sheets_service.py`     | Uses a single `values.append` call instead of scanning `A5:K` to find the next row.                                           |
+| **Pending Duplicate Suppression** | `src/main.py` + `src/sheets_service.py` | The request handler checks for an existing blank-decision row before queueing a write, and the worker rechecks as a fallback before append so duplicate active review items are not written. |
 | **Durable Session Store**   | `src/session_store.py`      | Persists session status in SQLite so polling, webhook updates, and restarts stay in sync.                                      |
 | **Durable Review Queue**    | `src/main.py`               | Review jobs are queued in SQLite and claimed by worker tasks, so requests are recoverable after restarts.                      |
 | **Reconciliation Cooldown** | `src/main.py` | Pending sessions reconcile from Google Sheets only after a per-session cooldown, preventing polling traffic from exhausting read quota. |
@@ -152,7 +160,7 @@ The current FastAPI application exposes the following endpoints:
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
-| `/hitl/v1/request_review` | `POST` | Main ADA chatbot entry point. Creates a durable session, queues a review job, and returns `status: processing` immediately. |
+| `/hitl/v1/request_review` | `POST` | Main ADA chatbot entry point. Creates a durable session and either queues a review job with `status: processing` or returns `pending_human_review` immediately, along with `duplicate_request_suppressed=true` and `row_number`, when a blank-decision row already exists for the same player. |
 | `/hitl/v1/status/session/{session_id}` | `GET` | Primary polling endpoint. Returns the persisted session and can reconcile pending rows from Google Sheets on a cooldown. |
 | `/hitl/v1/status/{player_id}/{row_number}` | `GET` | Legacy lookup path for older integrations that still key status checks by player ID and row number. |
 | `/webhook` | `POST` | Receives Apps Script callbacks after a human reviewer fills Decision and Notes. |
@@ -167,18 +175,23 @@ Notes:
 
 ### Testing
 ```powershell
-# 1. Submit a withdrawal with Name and Channel
+# 1. Submit a withdrawal with Name and Channel for a player that does not already have a blank Decision cell in the sheet
 Invoke-RestMethod -Uri "http://localhost:8000/hitl/v1/request_review" `
   -Method Post `
   -Headers @{"Content-Type"="application/json"} `
   -Body '{"player_id":"P100", "player_name":"Batuhan", "channel":"Chat"}'
 
-# 2. Extract session_id from response
+# 2. Extract session_id from the response
 
 # 3. Go to Google Sheets and simulate human review:
 #   - Column B timestamp is written automatically in GMT+2
 #   - Decision (Column I) = 'Yes'
 #   - Notes (Column J) = 'Verified manually'
+#   - If the same player already has a blank decision in Column I, the new request links to that existing row instead of appending another one
+
+# Optional duplicate-path check:
+# - Submit the same player_id again while Column I is still blank
+# - Expect status=pending_human_review, duplicate_request_suppressed=true, and the existing row_number in the response
 
 # 4. Poll status
 Invoke-RestMethod -Uri "http://localhost:8000/hitl/v1/status/session/YOUR_SESSION_ID"

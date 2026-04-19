@@ -310,6 +310,22 @@ def find_session_by_player_and_row(player_id: str, row_number: int) -> dict[str,
     return _row_to_session(row)
 
 
+def list_sessions_by_player_and_row(player_id: str, row_number: int) -> list[dict[str, Any]]:
+    conn = _get_connection()
+    rows = conn.execute(
+        """
+        SELECT session_id, player_id, player_name, channel, status,
+               row_number, decision, notes, row_data_json,
+               created_at, updated_at, error_count
+        FROM sessions
+        WHERE player_id = ? AND row_number = ?
+        ORDER BY created_at ASC
+        """,
+        (player_id, row_number),
+    ).fetchall()
+    return [_row_to_session(row) for row in rows if row is not None]
+
+
 def cleanup_expired_sessions() -> int:
     cutoff = (_utcnow() - timedelta(hours=config.SESSION_RETENTION_HOURS)).isoformat(timespec="seconds")
     conn = _get_connection()

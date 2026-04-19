@@ -723,6 +723,7 @@ The following table summarizes every optimization applied to the demo codebase a
 | --- | --- | --- |
 | Thread-local cached Sheets client with TTL | `src/sheets_service.py` | ADC-authenticated Cloud Run service account; no JSON key or local caching needed |
 | Semaphore-based Sheets API concurrency limit | `src/sheets_service.py` | Cloud Tasks queue rate limiting and max concurrent dispatches |
+| Request-path duplicate suppression on blank-decision rows | `src/main.py` + `src/sheets_service.py` | Cloud SQL uniqueness and idempotency rules prevent duplicate active review cases |
 | Per-session reconciliation cooldown | `src/main.py` | Cloud SQL is source of truth; no Sheets reconciliation needed |
 | Reconciliation cache cleanup in background worker | `src/main.py` | Cloud Scheduler + Cloud Run Jobs for periodic housekeeping |
 | Timing-safe webhook secret comparison | `src/main.py` | Cloud Armor + IAM-authenticated invocations replace shared secrets |
@@ -740,6 +741,7 @@ Before the shareholder demo:
 1. Start server with `python -m src.main` and confirm healthy startup logs
 2. Run `python -m src.test_concurrent --count 50 --mode staggered --batch-size 10` to stress test
 3. Verify all 50 rows appear in Google Sheets with correct timestamps, player IDs, and session IDs
+4. Submit the same player ID twice while Column I is still blank and verify the second request returns `pending_human_review` with duplicate suppression metadata instead of appending a second row
 4. Enter Decision + Notes on 5–10 rows and verify webhook delivery in server logs
 5. Poll status endpoints and confirm `approved`/`rejected` results
 6. Check `/metrics` for counters and zero failures
@@ -926,6 +928,7 @@ The following optimizations were applied to the demo codebase to support 10,000+
 ### `src/sheets_service.py`
 - **Thread-local cached Sheets client**: Avoids re-reading the service account JSON and re-building the API discovery client on every request. Clients are cached per-thread with a configurable TTL, maintaining thread safety (httplib2 is not thread-safe across threads)
 - **Semaphore-based concurrency limiter**: All Sheets API calls now acquire a semaphore before executing, preventing burst traffic from exceeding Google Sheets API quotas
+- **Pending duplicate lookup**: Exposes the sheet lookup used by the request handler and the worker fallback to detect an existing blank-decision row for the same player
 - **GMT+2 sheet timestamps**: Column B timestamps are written by the backend in GMT+2 so reviewer-facing sheet data matches the operational timezone expectation
 
 ### `src/session_store.py`
@@ -936,6 +939,7 @@ The following optimizations were applied to the demo codebase to support 10,000+
 - **Reconciliation throttle**: Per-session cooldown prevents excessive Sheets API reads during high-frequency polling. Without this, 10K pending sessions polled every 10–15 seconds would generate ~700 Sheets reads/second against a 5/second quota
 - **Reconciliation cache cleanup**: Background cleanup worker prunes stale entries from the throttle cache to prevent unbounded memory growth
 - **Timing-safe webhook secret comparison**: Uses `hmac.compare_digest()` instead of `!=` to prevent timing-based side-channel attacks on the shared webhook secret
+- **Immediate duplicate response path**: The request handler now checks for an existing blank-decision row before queueing a write and returns `pending_human_review`, `duplicate_request_suppressed=true`, and the reused `row_number` immediately when a duplicate active review already exists
 
 This is the strongest architecture to present now because it respects the company decision to keep Google Sheets, removes the highest-friction manual customer-support steps, and gives a credible enterprise migration path using standard Google Cloud services.
 

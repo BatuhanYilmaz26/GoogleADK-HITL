@@ -27,7 +27,7 @@ Before configuring ADA, ensure your Google Sheet can talk back to your local ser
 
 ## 2. ADA Action 1: Trigger Withdrawal Request
 
-This action initializes the process by creating a durable session and queueing a Sheets append job. A review worker then appends the row to Google Sheets asynchronously.
+This action initializes the process by creating a durable session. The backend then either queues a new Sheets write or immediately links the session to an existing blank-decision row for the same player.
 
 ### **Endpoint Tab**
 
@@ -61,7 +61,10 @@ This action initializes the process by creating a durable session and queueing a
 ADA needs to capture the `session_id` from the API response to use in the polling step.
 
 - Map the JSON key `session_id` to a new ADA variable named `meta_session_id`.
-- Expect the initial API response to be `status: processing` while the queued Google Sheets append is still being handled by a worker.
+- Optionally map `duplicate_request_suppressed` and `row_number` if you want ADA-side analytics or branching for reused review rows.
+- Expect one of these initial responses:
+  - `status: processing` when the request was accepted and a new Sheets write was queued.
+  - `status: pending_human_review` when the same player already has a row with an empty Decision column and the backend reuses that existing review row instead of appending a duplicate.
 
 ---
 
@@ -107,10 +110,13 @@ Below is the complete breakdown of all API statuses returned by the system:
 
 ### Core Workflow Endpoints
 *   **`POST /hitl/v1/request_review`**
-    *   `processing`: Returned instantly. The request was received and a sequence `session_id` was generated.
+  *   `processing`: Returned instantly. The request was received and a sequence `session_id` was generated, with a new Sheets write queued.
+  *   `pending_human_review`: Returned instantly when the player already has a pending row with a blank Decision column. The new request is linked to that existing review item and is not appended as a new row.
+  *   `duplicate_request_suppressed: true`: Additional response flag present when the request was linked to an existing pending row instead of being appended.
+  *   `row_number`: Present when the backend linked the request to an existing pending row.
 *   **`GET /hitl/v1/status/session/{session_id}`** (ADA Polling)
     *   `processing`: Request stored durably and waiting for a review worker to write to Google Sheets.
-    *   `pending_human_review`: Row successfully appended; system is waiting for the human reviewer to enter a decision.
+    *   `pending_human_review`: A review row exists for that player, either because the worker appended a new row or because it linked the session to an existing blank-decision row.
     *   `approved`: Human reviewer entered "Yes" (Column I) and Notes (Column J).
     *   `rejected`: Human reviewer entered anything other than "Yes" in Column I and Notes (Column J).
     *   `error`: The review job failed to write to Google Sheets.
@@ -142,6 +148,7 @@ Below is the complete breakdown of all API statuses returned by the system:
 | `⛔ WEBHOOK_URL is still set to the default` | Forgot to update Apps Script               | Replace `testurl.com` with your actual ngrok URL                    |
 | `ErrorLog` sheet has entries                 | All 3 webhook retries failed               | Check server is running; manually replay the decision                 |
 | Status remains `processing` for too long     | Worker backlog or Sheets write failure     | Check `/health`, `/metrics`, and logs for queue depth or review job failures |
+| Same player submits multiple requests but only one sheet row appears | Duplicate-pending suppression reused an existing blank-decision row | Expected behavior; poll the returned `session_id` and it will follow the existing review row until the human decision is finalized |
 | Timestamp not appearing in Col B               | Backend write failed before append         | Check server logs and `/metrics` for review job failures |
 | Status remains `pending_human_review` for too long | Webhook did not arrive yet or human review is incomplete | Ensure both Decision and Notes are filled; the status endpoint only reconciles pending rows periodically to protect Sheets quota |
 
@@ -167,7 +174,8 @@ Use this checklist before your first end-to-end demonstration:
 - [ ] Google Sheet is shared with the service account email (Editor role)
 - [ ] Apps Script has the `onEdit` installable trigger
 - [ ] Column B is formatted as **Plain Text** (Format → Number → Plain Text)
-- [ ] Single request test: `POST /hitl/v1/request_review` returns `status: processing` and `session_id`
+- [ ] Single new-player test: `POST /hitl/v1/request_review` returns `status: processing` and `session_id`
+- [ ] Duplicate-player test while Column I is blank: `POST /hitl/v1/request_review` returns `status: pending_human_review`, `duplicate_request_suppressed: true`, and the reused `row_number`
 - [ ] Sheet shows new row with Player ID, Name, and Channel after the queued worker processes the request
 - [ ] Timestamp is written automatically in Column B by the backend append in GMT+2
 - [ ] Typing Decision + Notes fires webhook (check server logs for `Webhook received`)
@@ -184,7 +192,6 @@ To ensure everything is working correctly:
 2. Trigger the flow via the ADA chatbot.
 3. Observe the server logs—you should see:
   - `ADA Request via Chatbot: player=...`
-  - `Review job started`
-  - `Sheet row appended at row ...`
+  - Either `Review job started` then `Sheet row appended at row ...`, or `Request response reused existing pending row=...` for a duplicate-pending request
 4. Edit the Google Sheet (Columns I & J) and verify the chat updates.
 5. Check the `/metrics` endpoint for request counts and success rates.

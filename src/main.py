@@ -130,8 +130,13 @@ def _reconcile_session_from_sheet(session: dict[str, Any]) -> dict[str, Any]:
     if row_snapshot is None:
         return session
 
+    row_data = row_snapshot["row_data"]
+    decision = row_snapshot["decision"]
+    notes = row_snapshot["notes"]
+    player_id, player_name, channel = _extract_player_fields(row_data)
     sheet_session_id = row_snapshot.get("session_id", "")
-    if sheet_session_id and sheet_session_id != session["session_id"]:
+    linked_duplicate = session.get("player_id") == player_id and session.get("row_number") == row_number
+    if sheet_session_id and sheet_session_id != session["session_id"] and not linked_duplicate:
         logger.warning(
             "Skipped sheet reconciliation for session=%s because row %s belongs to session=%s",
             session["session_id"],
@@ -139,11 +144,6 @@ def _reconcile_session_from_sheet(session: dict[str, Any]) -> dict[str, Any]:
             sheet_session_id,
         )
         return session
-
-    row_data = row_snapshot["row_data"]
-    decision = row_snapshot["decision"]
-    notes = row_snapshot["notes"]
-    player_id, player_name, channel = _extract_player_fields(row_data)
 
     update_fields: dict[str, Any] = {
         "row_data": row_data,
@@ -175,9 +175,52 @@ def _reconcile_session_from_sheet(session: dict[str, Any]) -> dict[str, Any]:
     return refreshed if refreshed is not None else session
 
 
+def _duplicate_request_message(player_id: str, row_number: int) -> str:
+    return (
+        "Duplicate request was not written to Google Sheets because player_id "
+        f"'{player_id}' already has a withdrawal row at row {row_number} with an empty Decision column."
+    )
+
+
+def _link_session_to_pending_row(
+    session_id: str,
+    player_id: str,
+    existing_pending_row: dict[str, Any],
+) -> None:
+    linked_player_id, linked_player_name, linked_channel = _extract_player_fields(existing_pending_row["row_data"])
+    session_store.update_session(
+        session_id,
+        status="pending_human_review",
+        row_number=existing_pending_row["row_number"],
+        decision=existing_pending_row["decision"] or None,
+        notes=existing_pending_row["notes"],
+        row_data=existing_pending_row["row_data"],
+        player_id=linked_player_id or player_id,
+        player_name=linked_player_name,
+        channel=linked_channel,
+    )
+
+
 def _run_review_job(session_id: str, player_id: str, player_name: str, channel: str) -> None:
     try:
         logger.info("Review job started for session=%s", session_id)
+        existing_pending_row = sheets_service.find_pending_review_row_for_player(player_id)
+        if existing_pending_row is not None:
+            _link_session_to_pending_row(session_id, player_id, existing_pending_row)
+            session_store.complete_review_job(session_id)
+            _increment_metric("review_jobs_completed")
+            logger.info(
+                "%s",
+                _duplicate_request_message(player_id, existing_pending_row["row_number"]),
+            )
+            logger.info(
+                "Review job skipped append for session=%s because player=%s already has pending row=%d",
+                session_id,
+                player_id,
+                existing_pending_row["row_number"],
+            )
+            return
+
         sheet_res = sheets_service.append_review_row(session_id, player_id, player_name, channel)
         row_number = sheet_res["row_number"]
         session_store.update_session(
@@ -410,6 +453,14 @@ async def webhook(payload: WebhookPayload, x_webhook_secret: str | None = Header
             "pending_human_review",
         )
 
+    linked_sessions: list[dict[str, Any]] = []
+    if payload.row_number is not None and player_id:
+        linked_sessions = await asyncio.to_thread(
+            session_store.list_sessions_by_player_and_row,
+            player_id,
+            payload.row_number,
+        )
+
     update_fields: dict[str, Any] = {
         "status": _status_from_decision(payload.decision),
         "decision": payload.decision,
@@ -422,7 +473,13 @@ async def webhook(payload: WebhookPayload, x_webhook_secret: str | None = Header
     if payload.row_number is not None:
         update_fields["row_number"] = payload.row_number
 
-    await asyncio.to_thread(session_store.update_session, payload.session_id, **update_fields)
+    target_session_ids = {payload.session_id, *[session["session_id"] for session in linked_sessions]}
+    await asyncio.gather(
+        *[
+            asyncio.to_thread(session_store.update_session, target_session_id, **update_fields)
+            for target_session_id in target_session_ids
+        ]
+    )
     _increment_metric("requests_succeeded")
     return {"status": "finalized", "message": "Updated session status."}
 
@@ -451,7 +508,7 @@ async def test_withdrawal(req: WithdrawalRequest):
 
 @app.post("/hitl/v1/request_review")
 async def ada_request_review(req: AdaWithdrawalRequest):
-    """ADA chatbot endpoint. Instantly returns 'processing' and a specific session_id."""
+    """ADA chatbot endpoint. Returns a new or linked session ID immediately."""
     _increment_metric("requests_total")
     actual_player_id = _normalise_player_id(req.playerUid or req.player_id)
     if not actual_player_id:
@@ -464,6 +521,18 @@ async def ada_request_review(req: AdaWithdrawalRequest):
     logger.info("ADA Request via Chatbot: player=%s", actual_player_id)
     logger.info("   Generated new sequence session=%s", session_id)
 
+    existing_pending_row: dict[str, Any] | None = None
+    try:
+        existing_pending_row = await asyncio.to_thread(
+            sheets_service.find_pending_review_row_for_player,
+            actual_player_id,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to preflight duplicate row check for player=%s; falling back to queued processing",
+            actual_player_id,
+        )
+
     await asyncio.to_thread(
         session_store.create_session,
         session_id,
@@ -472,6 +541,27 @@ async def ada_request_review(req: AdaWithdrawalRequest):
         req.channel or "Chat",
         "processing",
     )
+
+    if existing_pending_row is not None:
+        await asyncio.to_thread(
+            _link_session_to_pending_row,
+            session_id,
+            actual_player_id,
+            existing_pending_row,
+        )
+        logger.info(
+            "Request response reused existing pending row=%d for player=%s and returned pending_human_review",
+            existing_pending_row["row_number"],
+            actual_player_id,
+        )
+        return {
+            "status": "pending_human_review",
+            "session_id": session_id,
+            "message": _duplicate_request_message(actual_player_id, existing_pending_row["row_number"]),
+            "duplicate_request_suppressed": True,
+            "row_number": existing_pending_row["row_number"],
+        }
+
     await asyncio.to_thread(
         session_store.enqueue_review_job,
         session_id,
