@@ -9,6 +9,8 @@ This document is a comprehensive guide to understanding the **Human-in-the-Loop 
 ### The Goal
 The purpose of this system is to handle automated withdrawal requests from players (originating from a chatbot like Ada.cx) but with a mandatory **Human-in-the-Loop** step. The system operates as a low-latency router with durable state.
 
+Current-state note: this document describes the implementation that exists in this repository today. The Google Cloud migration guide describes a later target state in which SQLite is replaced by Cloud SQL for PostgreSQL and the local durable queue is replaced by Cloud Tasks.
+
 ### Core Flow
 1. **Trigger:** A chatbot (e.g., Ada) sends a withdrawal request to our Python server (`src/main.py`).
 2. **Fast Response:** The FastAPI server instantly generates a `session_id`, stores the session in SQLite, synchronously checks Google Sheets for an existing blank-decision row for that player, and either returns `{"status": "pending_human_review", "duplicate_request_suppressed": true, ...}` immediately or queues a new write and returns `{"status": "processing", "session_id": "xyz"}`.
@@ -58,6 +60,8 @@ Because the system is asynchronous and multi-threaded by nature, the Google Shee
 ### Durable SQLite Store (`src/session_store.py`)
 
 The demo uses SQLite as both a session store and a durable review-job queue.
+
+That is a current implementation choice, not a cloud-hosting equivalent of Cloud SQL. Moving this layer to Cloud SQL for PostgreSQL would require a planned persistence refactor because `src/session_store.py` currently depends on SQLite-specific connection handling, PRAGMAs, and locking behavior.
 
 *   **WAL mode**: Enables strong concurrent read behavior.
 *   **Tuned pragmas**: `busy_timeout`, page-cache sizing, and `mmap_size` improve stability under concurrent access.

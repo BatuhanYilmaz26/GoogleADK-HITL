@@ -58,6 +58,10 @@ This preserves the existing workflow while moving reliability, recovery, and sec
 
 ## 4. Target Architecture
 
+The diagram below shows the recommended post-migration target state. The current implementation still uses SQLite for session state and the local durable queue.
+
+Moving from SQLite to Cloud SQL for PostgreSQL is a planned architecture change rather than a drop-in database switch.
+
 ```mermaid
 flowchart LR
         P[Player] --> ADA[Ada.cx Chatbot]
@@ -142,6 +146,8 @@ Activities:
 ### Phase 2: Durable state and async control
 
 Goal: remove dependence on local SQLite and in-process workers.
+
+This phase requires refactoring the current SQLite-specific persistence layer into a Cloud SQL-compatible implementation for PostgreSQL.
 
 Activities:
 

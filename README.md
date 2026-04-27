@@ -8,6 +8,8 @@
 
 This system delivers **end-to-end withdrawal automation** - from the moment a player requests a withdrawal in the chatbot, to the final decision being relayed back, with zero manual data entry in between.
 
+Current-state note: this repository runs today with FastAPI, Google Sheets, and a local SQLite-backed session and review-job store. The separate Google Cloud migration guide describes the recommended target architecture for a later phase, where SQLite would be replaced by Cloud SQL and the local queue would be replaced by Cloud Tasks.
+
 - **Fast & Durable**: The request path persists session state immediately, then either queues a Google Sheets write or instantly links the new session to an existing pending row for the same player.
 - **Chatbot-native**: Players initiate withdrawals directly through the ADA chatbot — no context switching for the player or the agent.
 - **Instant dashboard logging**: New requests are appended to the HITL Google Sheet unless the same player already has a pending blank-decision row, in which case the new session links to the existing review row.
@@ -119,6 +121,7 @@ This system is designed so that **zero withdrawal requests are missed or skipped
 - Set `CORS_ALLOW_ORIGINS` to the exact ADA domains you expect instead of `*`.
 - Only the Apps Script `onEdit` trigger is required now; backend writes Column B timestamps directly in GMT+2.
 - SQLite WAL mode intentionally creates `hitl_sessions.db`, `hitl_sessions.db-wal`, and `hitl_sessions.db-shm` while the app is active; those files belong to the same database and should not be deleted manually.
+- If you later move this deployment to Google Cloud, treat Cloud SQL for PostgreSQL as a planned persistence migration, not a drop-in replacement for the current SQLite code path.
 
 ## Recommended Profiles
 
